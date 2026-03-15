@@ -11,8 +11,10 @@ token = "replace_with_token"
 protocol = "quic"
 
 [transport.tls]
-cert_file = "/path/to/server-cert.pem"
-key_file = "/path/to/server-key.pem"
+cert_file = "/path/to/server.crt"
+key_file = "/path/to/server.key"
+# The certificate should contain the public hostname/IP in subjectAltName.
+# QUIC uses UDP, so make sure the QUIC port is allowed by the network/firewall.
 
 [[allow_ports]]
 start = 6001

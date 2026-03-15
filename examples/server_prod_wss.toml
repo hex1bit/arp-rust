@@ -1,0 +1,22 @@
+bind_addr = "0.0.0.0"
+bind_port = 443
+
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "websocket"
+tcp_mux = true
+
+[transport.tls]
+enable = true
+cert_file = "/etc/arp/server.crt"
+key_file = "/etc/arp/server.key"
+
+[[allow_ports]]
+start = 6001
+end = 7000
+

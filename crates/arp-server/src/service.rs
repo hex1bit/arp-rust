@@ -211,15 +211,21 @@ impl Service {
     async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         let peer_addr = stream.peer_addr().map_err(|e| Error::Io(e))?;
         let transport = if self.config.transport.protocol == "websocket" {
-            if self.config.transport.tls.enable {
-                return Err(Error::Config(
-                    "websocket + tls is not supported yet".to_string(),
-                ));
+            if let Some(acceptor) = &self.tls_acceptor {
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| Error::Transport(format!("WSS TLS accept failed: {}", e)))?;
+                let ws = accept_async(tls_stream)
+                    .await
+                    .map_err(|e| Error::Transport(format!("WSS accept failed: {}", e)))?;
+                MessageTransport::from_stream(websocket_to_stream(ws))
+            } else {
+                let ws = accept_async(stream)
+                    .await
+                    .map_err(|e| Error::Transport(format!("WS accept failed: {}", e)))?;
+                MessageTransport::from_stream(websocket_to_stream(ws))
             }
-            let ws = accept_async(stream)
-                .await
-                .map_err(|e| Error::Transport(format!("WS accept failed: {}", e)))?;
-            MessageTransport::from_stream(websocket_to_stream(ws))
         } else if let Some(acceptor) = &self.tls_acceptor {
             let tls_stream = acceptor
                 .accept(stream)

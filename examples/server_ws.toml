@@ -12,3 +12,11 @@ protocol = "websocket"
 [[allow_ports]]
 start = 6001
 end = 7000
+
+[transport.tls]
+# Set enable = true to use WSS instead of plain WS.
+enable = false
+# cert_file = "/path/to/server.crt"
+# key_file = "/path/to/server.key"
+# The certificate should contain the public hostname/IP in subjectAltName.
+# Generate it as a server certificate with basicConstraints=CA:FALSE.

@@ -41,7 +41,12 @@
 ### 关键实现点（WebSocket 传输）
 - 当 `transport.protocol = "websocket"` 时，控制连接与工作连接均通过 WS 建立。
 - 通过 `ws_stream` 桥接器把 WS 二进制帧映射为字节流，复用现有消息编解码与代理数据通道逻辑。
-- 当前仅支持 `ws`（明文）；`wss` 将在后续阶段补齐。
+- 当 `transport.tls.enable = true` 时，WS 握手运行在 TLS 之上，形成 `wss` 连接。
+
+### WSS 与 QUIC 的实现侧差异
+- `wss` 复用已有 TCP/TLS 字节流路径，只是在应用层增加了 WebSocket 握手与二进制帧桥接。
+- `quic` 使用独立的 QUIC endpoint 与双向流，传输路径和握手模型都与 TCP/TLS/WS 分支不同。
+- 从当前代码结构看，`wss` 更偏“兼容性增强”，`quic` 更偏“传输能力增强”。
 
 ### 关键实现点（管理接口）
 - 服务端在 `dashboard_port > 0` 时启动管理接口。

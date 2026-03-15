@@ -31,6 +31,7 @@ bash test/test_e2e.sh
 - `test/test_e2e_tcp_lb_health.sh` 覆盖 TCP 分组负载均衡与健康检查摘除/恢复联动
 - `test/test_e2e_xtcp.sh` 覆盖 XTCP 服务提供端/访问端 NAT 打洞协商主流程与 `sk` 错误场景
 - `test/test_e2e_ws.sh` 覆盖 WebSocket 传输下控制连接、工作连接和 TCP 转发链路
+- `test/test_e2e_wss.sh` 覆盖 WSS 传输下控制连接、工作连接和 TCP 转发链路
 
 ## 3. HTTP/HTTPS 虚拟主机端到端测试
 

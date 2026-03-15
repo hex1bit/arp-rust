@@ -1,5 +1,6 @@
 server_addr = "your.server.name"
-server_port = 17000
+server_port = 443
+
 log_level = "info"
 
 [auth]
@@ -7,17 +8,17 @@ method = "token"
 token = "replace_with_token"
 
 [transport]
-protocol = "quic"
+protocol = "websocket"
+tcp_mux = true
 pool_count = 1
 
 [transport.tls]
-trusted_ca_file = "/path/to/server.crt"
+enable = true
+trusted_ca_file = "/etc/arp/server.crt"
 server_name = "your.server.name"
-# QUIC requires UDP reachability between client and server.
-# server_name must match the server certificate SAN/CN.
 
 [[proxies]]
-name = "quic_ssh"
+name = "ssh"
 type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 22

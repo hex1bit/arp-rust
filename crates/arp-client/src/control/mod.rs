@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_kcp::{KcpConfig, KcpNoDelayConfig, KcpStream};
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async;
 use tracing::{debug, error, info, warn};
 
 use arp_common::config::{ClientConfig, VisitorConfig};
@@ -688,16 +688,35 @@ async fn connect_server_transport(config: &ClientConfig) -> Result<MessageTransp
     }
 
     if config.transport.protocol == "websocket" {
-        if config.transport.tls.enable {
-            return Err(Error::Config(
-                "websocket + tls is not supported yet".to_string(),
-            ));
-        }
-        let ws_url = format!("ws://{}:{}/ws", config.server_addr, config.server_port);
-        let (ws, _) = connect_async(&ws_url)
+        let ws_scheme = if config.transport.tls.enable {
+            "wss"
+        } else {
+            "ws"
+        };
+        let ws_url = format!(
+            "{}://{}:{}/ws",
+            ws_scheme, config.server_addr, config.server_port
+        );
+        let stream = TcpStream::connect(format!("{}:{}", config.server_addr, config.server_port))
             .await
-            .map_err(|e| Error::Transport(format!("WS connect failed: {}", e)))?;
-        return Ok(MessageTransport::from_stream(websocket_to_stream(ws)));
+            .map_err(Error::Io)?;
+        if config.transport.tls.enable {
+            let connector = build_tls_connector(config)?;
+            let server_name = tls_server_name(config)?;
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| Error::Transport(format!("WSS TLS connect failed: {}", e)))?;
+            let (ws, _) = client_async(&ws_url, tls_stream)
+                .await
+                .map_err(|e| Error::Transport(format!("WSS handshake failed: {}", e)))?;
+            return Ok(MessageTransport::from_stream(websocket_to_stream(ws)));
+        } else {
+            let (ws, _) = client_async(&ws_url, stream)
+                .await
+                .map_err(|e| Error::Transport(format!("WS handshake failed: {}", e)))?;
+            return Ok(MessageTransport::from_stream(websocket_to_stream(ws)));
+        }
     }
 
     let server_addr = format!("{}:{}", config.server_addr, config.server_port);
@@ -708,13 +727,7 @@ async fn connect_server_transport(config: &ClientConfig) -> Result<MessageTransp
     }
 
     let connector = build_tls_connector(config)?;
-    let server_name = if !config.transport.tls.server_name.is_empty() {
-        config.transport.tls.server_name.clone()
-    } else {
-        config.server_addr.clone()
-    };
-    let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
-        .map_err(|e| Error::Config(format!("Invalid TLS server_name {}: {}", server_name, e)))?;
+    let server_name = tls_server_name(config)?;
 
     let tls_stream = connector
         .connect(server_name, stream)
@@ -807,4 +820,15 @@ fn build_tls_connector(config: &ClientConfig) -> Result<TlsConnector> {
         .with_no_client_auth();
 
     Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
+fn tls_server_name(config: &ClientConfig) -> Result<rustls::pki_types::ServerName<'static>> {
+    let server_name = if !config.transport.tls.server_name.is_empty() {
+        config.transport.tls.server_name.clone()
+    } else {
+        config.server_addr.clone()
+    };
+    rustls::pki_types::ServerName::try_from(server_name.clone())
+        .map(|name| name.to_owned())
+        .map_err(|e| Error::Config(format!("Invalid TLS server_name {}: {}", server_name, e)))
 }

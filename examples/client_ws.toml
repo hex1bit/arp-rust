@@ -10,6 +10,13 @@ token = "replace_with_token"
 protocol = "websocket"
 pool_count = 1
 
+[transport.tls]
+# Set enable = true to use WSS instead of plain WS.
+enable = false
+# trusted_ca_file = "/path/to/server.crt"
+# server_name = "your.server.name"
+# server_name must match the server certificate SAN/CN.
+
 [[proxies]]
 name = "ssh_ws"
 type = "tcp"

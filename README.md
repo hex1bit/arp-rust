@@ -1,74 +1,102 @@
 # ARP-Rust
 
-[English README](README_EN.md)
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
-> 使用Rust语言实现的高性能内网穿透工具
+ARP in `ARP-Rust` stands for `Advance Reverse Proxy`.
 
-ARP-Rust 中的 `ARP` 指 `Advance Reverse Proxy`。项目使用 Rust 实现，目标是提供快速、安全、高性能的反向代理能力，用于将本地服务安全暴露到公网。
+ARP-Rust is a reverse proxy and tunneling tool written in Rust. It uses a client/server model to expose private TCP, UDP, HTTP, and HTTPS services to the public network, with support for multiple transport backends including TCP, TLS, KCP, QUIC, WebSocket, and WebSocket over TLS (`wss`).
 
-## ✨ 特性
+## Status
 
-- 🚀 **高性能**: 基于Tokio异步运行时，充分利用Rust的零成本抽象
-- 🔒 **内存安全**: Rust的所有权系统确保无内存泄漏和数据竞争
-- 📦 **轻量级**: 单二进制文件，无运行时依赖，体积小
-- 🔐 **安全认证**: 支持Token认证
-- 🌐 **TCP代理**: 支持TCP端口映射
-- 📡 **UDP代理**: 支持UDP端口映射与回包
-- ⚡ **UDP持久隧道**: UDP请求复用单条工作连接（减少每包建连开销）
-- 🌍 **HTTP/HTTPS虚拟主机**: 支持基于Host/SNI的域名路由
-- 🔐 **数据安全（部分）**: UDP链路支持 `use_compression` + `use_encryption`
-- 🔐 **STCP/SUDP（基础）**: 支持 `stcp` 与 `sudp` 代理类型（`sudp` 强制加密）
-- 🕳️ **XTCP（NAT 打洞流程）**: 支持 provider/visitor 协商、打洞协商与点对点转发
-- ⚖️ **TCP/STCP 负载均衡分组**: `load_balancer.group/group_key` 支持同端口分组轮询
-- 🩺 **健康检查联动摘除/恢复**: 后端异常自动临时摘除，恢复后自动回流
-- 🔒 **TLS传输**: 控制连接与工作连接支持TLS
-- 🚄 **KCP 传输**: 支持 `transport.protocol = "kcp"`
-- 🚀 **QUIC 传输**: 支持 `transport.protocol = "quic"`
-- 🔌 **WebSocket 传输**: 支持 `transport.protocol = "websocket"`（控制/工作连接）
-- 📈 **管理接口**: 支持 `/healthz`、`/metrics`、`/api/v1/status`、`/api/v1/proxies`
-- 📝 **易于配置**: 使用TOML配置文件
+ARP-Rust is already usable for real client/server forwarding scenarios, including public-network deployments. At the current stage, the most validated transport paths are:
 
-## 🏗️ 项目架构
+- `tcp`
+- `tcp + tls`
+- `ws`
+- `wss`
+- `quic`
 
-```
+For first-time production deployment, `wss` is the recommended default because it balances compatibility, encryption, and ease of deployment.
+
+## Why ARP-Rust
+
+ARP-Rust is aimed at users who want a self-hosted tunneling tool with:
+
+- a compact Rust implementation
+- multiple transport backends instead of a single fixed tunnel type
+- support for both raw TCP/UDP forwarding and HTTP/HTTPS virtual-host routing
+- optional secure and NAT-traversal-oriented proxy modes such as `stcp`, `sudp`, and `xtcp`
+- a practical path from simple local testing to public-internet deployment
+
+## Use Cases
+
+Typical use cases include:
+
+- exposing SSH on a private machine through a public server
+- publishing an internal web service through HTTP/HTTPS virtual-host routing
+- forwarding private database or cache ports for controlled remote access
+- exposing custom TCP or UDP services from home labs or office networks
+- building a small multi-node TCP service behind one public port with load balancing
+- testing NAT traversal flows with `xtcp`
+
+## Production Notes
+
+Before deploying ARP-Rust to the public internet, verify the following:
+
+- use `wss` or `tcp + tls` instead of plain `tcp`
+- make sure `auth.token` is changed from the example placeholder
+- generate a proper server certificate with matching `subjectAltName`
+- keep `transport.tls.server_name` aligned with the certificate hostname
+- open only the control port and the required `allow_ports` range in the firewall
+- start with a single `tcp` proxy first, then expand to more transports or proxy types
+
+## Features
+
+- Async runtime based on Tokio
+- TCP proxy
+- UDP proxy and persistent UDP tunnel
+- HTTP/HTTPS virtual host routing
+- STCP / SUDP support
+- XTCP NAT traversal workflow
+- TCP load-balancing groups
+- Health-check-based backend eject/recover
+- TLS transport
+- KCP transport
+- QUIC transport
+- WebSocket transport (`ws` / `wss`)
+- Admin endpoints for health, metrics, and proxy status
+- TOML-based configuration
+
+## Workspace Layout
+
+```text
 arp-rust/
 ├── crates/
-│   ├── arp-common/     # 公共库 (协议、传输层、认证)
-│   ├── arp-server/     # 服务端 (arps)
-│   └── arp-client/     # 客户端 (arpc)
-├── examples/           # 配置文件示例
-└── README.md
+│   ├── arp-common/
+│   ├── arp-server/
+│   └── arp-client/
+├── examples/
+├── docs/
+└── test/
 ```
 
-### 核心组件
-
-- **消息协议**: 基于JSON的消息格式，支持Login、NewProxy、StartWorkConn等消息类型
-- **传输层**: 基于tokio-util的编解码器，支持消息序列化和反序列化
-- **认证系统**: 可扩展的认证框架，当前支持Token认证
-- **代理管理**: 动态代理注册和管理，支持TCP代理类型
-
-## 🚀 快速开始
-
-### 安装
-
-#### 从源码编译
+## Build
 
 ```bash
-git clone https://github.com/hex1bit/arp-rust.git
-cd arp-rust
-cargo build --release
+cargo build --workspace --release
 ```
 
-编译后的二进制文件位于 `target/release/`:
-- `arps` - 服务端
-- `arpc` - 客户端
+Release binaries:
 
-### 配置
+- `target/release/arps`
+- `target/release/arpc`
 
-#### 服务端配置 (server.toml)
+If you want prepacked release bundles with example configs, place the binaries together with the files under `examples/` and your chosen certificate files.
+
+## Quick Start
+
+Server example:
 
 ```toml
 bind_addr = "0.0.0.0"
@@ -87,7 +115,7 @@ start = 6001
 end = 7000
 ```
 
-#### 客户端配置 (client.toml)
+Client example:
 
 ```toml
 server_addr = "server.example.com"
@@ -110,179 +138,232 @@ local_port = 22
 remote_port = 6001
 ```
 
-### 运行
-
-#### 1. 启动服务端
+Run:
 
 ```bash
 ./target/release/arps -c server.toml
-```
-
-#### 2. 启动客户端
-
-```bash
 ./target/release/arpc -c client.toml
 ```
 
-#### 3. 连接到内网服务
+Then connect through the public side:
 
 ```bash
 ssh user@server.example.com -p 6001
 ```
 
-### XTCP 示例
+This quick start uses plain TCP for simplicity. For public production usage, prefer the `WSS` deployment path described below.
 
-服务提供端（暴露本地 22）可参考：
-- `examples/client_xtcp_provider.toml`
+## Proxy Types
 
-访问端（本地监听 6001）可参考：
-- `examples/client_xtcp_visitor.toml`
+Supported `[[proxies]].type` values include:
 
-### KCP / QUIC 示例
+- `tcp`
+- `udp`
+- `http`
+- `https`
+- `stcp`
+- `sudp`
+- `xtcp`
+
+In practice:
+
+- use `tcp` for generic TCP services such as SSH, databases, custom TCP applications, and game servers
+- use `udp` for UDP-based services such as DNS-like workloads and custom UDP protocols
+- use `http` / `https` when you want virtual-host routing based on `Host` or TLS `SNI`
+- use `stcp` / `sudp` / `xtcp` when you need shared-secret or NAT traversal flows
+
+## Transport Protocols
+
+Supported `transport.protocol` values include:
+
+- `tcp`
+- `kcp`
+- `quic`
+- `websocket`
+
+TLS can be enabled on top of TCP and WebSocket via `transport.tls.enable = true`.
+
+A practical rule of thumb:
+
+- choose plain `tcp` for the simplest and most stable setup
+- choose `tcp + tls` for production deployments on the public internet
+- choose `wss` when compatibility with web infrastructure or restricted networks matters most
+- choose `quic` when UDP is available and you want better transport performance
+
+In other words:
+
+- choose `wss` as the safe default
+- choose `quic` as the performance-oriented option
+- choose plain `tcp` mainly for local, lab, or controlled-network setups
+
+## Recommended Deployment Path
+
+If you are deploying ARP-Rust for the first time, the most practical rollout order is:
+
+1. Start with plain `tcp` on a controlled network
+2. Move to `tcp + tls` or `wss` before exposing the service to the public internet
+3. Use `wss` if you want easier compatibility with reverse proxies, port 443, or restricted networks
+4. Use `quic` only after confirming UDP reachability and firewall policy
+
+Recommended defaults:
+
+- local or lab setup: `tcp`
+- public production setup: `wss`
+- performance-oriented deployment with confirmed UDP support: `quic`
+
+## WSS vs QUIC
+
+- `wss`
+  - runs on top of `TCP + TLS + WebSocket`
+  - easier to integrate with reverse proxies, CDNs, and HTTP/HTTPS-only environments
+  - better when you need compatibility and web-like traffic shape
+  - usually has more protocol overhead than QUIC
+
+- `quic`
+  - runs on top of `UDP` with built-in TLS
+  - usually performs better for handshake latency, multiplexing, and high concurrency
+  - better when you control the network and UDP is available
+  - depends on firewall and upstream UDP reachability
+
+Practical guidance:
+
+- choose `wss` first for compatibility and restricted networks
+- choose `quic` first for performance-oriented deployments where UDP is allowed
+
+## Example Configs
+
+General examples:
+
+- `examples/server.toml`
+- `examples/client.toml`
+
+WebSocket / WSS:
+
+- `examples/server_ws.toml`
+- `examples/client_ws.toml`
+- `examples/server_prod_wss.toml`
+- `examples/client_prod_wss.toml`
+
+KCP / QUIC:
 
 - `examples/server_kcp.toml`
 - `examples/client_kcp.toml`
 - `examples/server_quic.toml`
 - `examples/client_quic.toml`
 
-## 📊 测试结果
+XTCP:
 
-### 基础功能测试
+- `examples/client_xtcp_provider.toml`
+- `examples/client_xtcp_visitor.toml`
 
-✓ 服务端启动正常  
-✓ 客户端连接成功  
-✓ 代理注册成功  
-✓ TCP端口转发工作正常  
-✓ UDP端口转发工作正常  
-✓ HTTP虚拟主机路由正常  
-✓ HTTPS SNI虚拟主机路由正常  
-✓ 多连接并发处理正常  
+## TLS / WSS Certificates
 
-### 测试日志示例
+When `transport.tls.enable = true`, the server certificate should:
 
-```
-Server Log:
-2026-03-13T17:21:50.414796Z  INFO arps::service: Client login from 127.0.0.1:60862
-2026-03-13T17:21:50.415108Z  INFO arps::resource: Allocated TCP port: 6100
-2026-03-13T17:21:50.415308Z  INFO arps::proxy::tcp: TCP proxy echo_test listening on 0.0.0.0:6100
-2026-03-13T17:21:50.415340Z  INFO arps::proxy: Proxy registered successfully
+- be a server certificate, not `CA:TRUE`
+- include the real hostname or IP in `subjectAltName`
+- match the client-side `transport.tls.server_name`
+- be trusted by the client via `trusted_ca_file`
 
-Client Log:
-2026-03-13T17:21:50.411218Z  INFO arpc::control: Connecting to server: 127.0.0.1:17000
-2026-03-13T17:21:50.414996Z  INFO arpc::control: Login successful, run_id: 622efa5a-3f94-48c0-9329-241b988976eb
-2026-03-13T17:21:50.415397Z  INFO arpc::control: Proxy echo_test registered successfully, remote address: 0.0.0.0:6100
-```
-
-## 🔧 开发
-
-### 运行测试
+Recommended self-signed certificate command:
 
 ```bash
-# 单元测试
-cargo test
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout server.key \
+  -out server.crt \
+  -days 365 \
+  -subj "/CN=your.server.name" \
+  -addext "subjectAltName=DNS:your.server.name,IP:127.0.0.1" \
+  -addext "basicConstraints=CA:FALSE" \
+  -addext "keyUsage=digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"
+```
 
-# TCP端到端测试
+Or use the helper script:
+
+```bash
+cd examples
+bash gen_self_signed_cert.sh your.server.name 1.2.3.4
+```
+
+## WSS Deployment Steps
+
+1. Generate the server certificate and key:
+
+```bash
+cd examples
+bash gen_self_signed_cert.sh your.server.name 1.2.3.4
+```
+
+2. Copy them to the server:
+
+```bash
+sudo mkdir -p /etc/arp
+sudo cp server.crt /etc/arp/server.crt
+sudo cp server.key /etc/arp/server.key
+sudo chmod 600 /etc/arp/server.key
+```
+
+3. Prepare the server config using `examples/server_prod_wss.toml`
+
+4. Prepare the client config using `examples/client_prod_wss.toml`
+
+5. Start and verify:
+
+```bash
+./target/release/arps -c examples/server_prod_wss.toml
+./target/release/arpc -c examples/client_prod_wss.toml
+nc -vz your.server.name 6001
+```
+
+If `nc -vz your.server.name 6001` succeeds but application traffic still fails, check:
+
+- the client-side `local_ip` / `local_port`
+- the server firewall or cloud security group
+- certificate hostname matching
+- whether another process is already using the chosen remote port
+
+## Tests
+
+Unit tests:
+
+```bash
+cargo test --workspace
+```
+
+End-to-end tests:
+
+```bash
 bash test/test_e2e.sh
-
-# TCP mux 并发端到端测试
 bash test/test_e2e_tcp_mux.sh
-
-# HTTP/HTTPS虚拟主机端到端测试
 bash test/test_e2e_vhost.sh
-
-# UDP端到端测试
 bash test/test_e2e_udp.sh
-
-# STCP/SUDP 端到端测试
 bash test/test_e2e_stcp_sudp.sh
-
-# TCP 负载均衡 + 健康联动端到端测试
 bash test/test_e2e_tcp_lb_health.sh
-
-# XTCP NAT 打洞端到端测试
 bash test/test_e2e_xtcp.sh
-
-# WebSocket 传输端到端测试
 bash test/test_e2e_ws.sh
-
-# TLS传输端到端测试
+bash test/test_e2e_wss.sh
 bash test/test_e2e_tls.sh
-
-# KCP传输端到端测试
 bash test/test_e2e_kcp.sh
-
-# QUIC传输端到端测试
 bash test/test_e2e_quic.sh
 ```
 
-### 管理接口
+## Admin Endpoints
 
-服务端配置 `dashboard_addr` 与 `dashboard_port` 后可用：
+When `dashboard_addr` and `dashboard_port` are configured on the server:
 
-- `GET /healthz` 健康检查
-- `GET /metrics` 指标输出（包含连接/字节/tcp_mux流计数）
-- `GET /api/v1/status` 服务状态（JSON）
-- `GET /api/v1/proxies` 代理列表（JSON）
+- `GET /healthz`
+- `GET /metrics`
+- `GET /api/v1/status`
+- `GET /api/v1/proxies`
 
-### 代码检查
+## Development
 
 ```bash
-# 格式化
-cargo fmt
-
-# Lint检查
-cargo clippy
-
-# 编译检查
-cargo check
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-## 📖 技术栈
+## License
 
-- **运行时**: [Tokio](https://tokio.rs/) - 异步运行时
-- **序列化**: [Serde](https://serde.rs/) - 序列化/反序列化
-- **配置解析**: [TOML](https://github.com/toml-rs/toml) - 配置文件格式
-- **日志**: [Tracing](https://github.com/tokio-rs/tracing) - 结构化日志
-- **命令行**: [Clap](https://github.com/clap-rs/clap) - 命令行参数解析
-- **并发**: [DashMap](https://github.com/xacrimon/dashmap) - 并发HashMap
-
-## 🗺️ 路线图
-
-### 已完成 ✅
-- [x] 基础架构设计
-- [x] 消息协议实现
-- [x] TCP代理支持
-- [x] Token认证
-- [x] 服务端/客户端基础功能
-- [x] 端口资源管理
-- [x] E2E测试验证
-- [x] HTTP/HTTPS虚拟主机支持
-- [x] UDP代理支持
-- [x] TLS加密传输
-- [x] 健康检查
-- [x] 负载均衡（TCP/STCP 分组 + VHost 多后端轮询）
-- [x] XTCP NAT 打洞基础流程（服务提供端/访问端）
-
-### 计划中 📋
-- [ ] WebSocket over TLS (`wss`)
-
-## 🤝 贡献
-
-欢迎贡献代码、报告问题或提出新功能建议！
-
-## 📄 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 🙏 致谢
-
-- Rust社区的所有贡献者
-
-## 📞 联系方式
-
-- 项目地址: https://github.com/hex1bit/arp-rust
-- Issue追踪: https://github.com/hex1bit/arp-rust/issues
-
----
-
-**注意**: 这是一个学习项目，用于探索Rust在网络编程领域的应用。如需生产环境使用，请进行充分测试。
+MIT

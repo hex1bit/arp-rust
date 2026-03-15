@@ -341,6 +341,32 @@ impl ServerConfig {
         if self.bind_port == 0 {
             return Err(Error::Config("bind_port cannot be 0".to_string()));
         }
+        match self.transport.protocol.as_str() {
+            "tcp" | "kcp" | "quic" | "websocket" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "unsupported transport.protocol: {}",
+                    other
+                )));
+            }
+        }
+        if self.transport.protocol == "quic"
+            && (self.transport.tls.cert_file.is_empty() || self.transport.tls.key_file.is_empty())
+        {
+            return Err(Error::Config(
+                "quic transport requires transport.tls.cert_file and transport.tls.key_file"
+                    .to_string(),
+            ));
+        }
+        if self.transport.protocol == "websocket"
+            && self.transport.tls.enable
+            && (self.transport.tls.cert_file.is_empty() || self.transport.tls.key_file.is_empty())
+        {
+            return Err(Error::Config(
+                "websocket + tls requires transport.tls.cert_file and transport.tls.key_file"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -360,6 +386,43 @@ impl ClientConfig {
         }
         if self.server_port == 0 {
             return Err(Error::Config("server_port cannot be 0".to_string()));
+        }
+        match self.transport.protocol.as_str() {
+            "tcp" | "kcp" | "quic" | "websocket" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "unsupported transport.protocol: {}",
+                    other
+                )));
+            }
+        }
+        if (self.transport.protocol == "quic"
+            || (self.transport.protocol == "websocket" && self.transport.tls.enable)
+            || (self.transport.protocol == "tcp" && self.transport.tls.enable))
+            && self.transport.tls.trusted_ca_file.trim().is_empty()
+        {
+            return Err(Error::Config(format!(
+                "{} transport requires transport.tls.trusted_ca_file",
+                if self.transport.protocol == "websocket" {
+                    "websocket + tls"
+                } else {
+                    self.transport.protocol.as_str()
+                }
+            )));
+        }
+        if (self.transport.protocol == "quic"
+            || (self.transport.protocol == "websocket" && self.transport.tls.enable))
+            && self.server_addr.parse::<std::net::IpAddr>().is_ok()
+            && self.transport.tls.server_name.trim().is_empty()
+        {
+            return Err(Error::Config(format!(
+                "{} transport with IP server_addr requires transport.tls.server_name",
+                if self.transport.protocol == "websocket" {
+                    "websocket + tls"
+                } else {
+                    self.transport.protocol.as_str()
+                }
+            )));
         }
         for proxy in &self.proxies {
             proxy.validate()?;
@@ -538,5 +601,89 @@ mod tests {
         let mut xtcp_ok = base_proxy("xtcp");
         xtcp_ok.sk = "secret".to_string();
         assert!(xtcp_ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_client_websocket_tls_requires_ca() {
+        let cfg = ClientConfig {
+            server_addr: "example.com".to_string(),
+            server_port: 7000,
+            log_level: String::new(),
+            auth: AuthConfig::default(),
+            transport: TransportConfig {
+                protocol: "websocket".to_string(),
+                tls: TlsConfig {
+                    enable: true,
+                    ..TlsConfig::default()
+                },
+                ..TransportConfig::default()
+            },
+            admin_addr: String::new(),
+            admin_port: 0,
+            admin_user: String::new(),
+            admin_pwd: String::new(),
+            proxies: Vec::new(),
+            visitors: Vec::new(),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_client_websocket_tls_requires_server_name_for_ip() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            log_level: String::new(),
+            auth: AuthConfig::default(),
+            transport: TransportConfig {
+                protocol: "websocket".to_string(),
+                tls: TlsConfig {
+                    enable: true,
+                    trusted_ca_file: "ca.pem".to_string(),
+                    ..TlsConfig::default()
+                },
+                ..TransportConfig::default()
+            },
+            admin_addr: String::new(),
+            admin_port: 0,
+            admin_user: String::new(),
+            admin_pwd: String::new(),
+            proxies: Vec::new(),
+            visitors: Vec::new(),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_server_websocket_tls_requires_cert_and_key() {
+        let cfg = ServerConfig {
+            bind_addr: "0.0.0.0".to_string(),
+            bind_port: 7000,
+            kcp_bind_port: 0,
+            quic_bind_port: 0,
+            vhost_http_port: 0,
+            vhost_https_port: 0,
+            dashboard_addr: String::new(),
+            dashboard_port: 0,
+            dashboard_user: String::new(),
+            dashboard_pwd: String::new(),
+            log_level: String::new(),
+            auth: AuthConfig::default(),
+            transport: TransportConfig {
+                protocol: "websocket".to_string(),
+                tls: TlsConfig {
+                    enable: true,
+                    ..TlsConfig::default()
+                },
+                ..TransportConfig::default()
+            },
+            allow_ports: Vec::new(),
+            max_pool_count: 0,
+            max_ports_per_client: 0,
+            subdomain_host: String::new(),
+            tcp_mux: false,
+            custom: HashMap::new(),
+        };
+        assert!(cfg.validate().is_err());
     }
 }
