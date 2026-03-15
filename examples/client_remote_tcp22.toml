@@ -1,0 +1,20 @@
+server_addr = "server.example.com"
+server_port = 17000
+
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "tcp"
+tcp_mux = true
+pool_count = 2
+
+[[proxies]]
+name = "ssh_tcp_22"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 6001

@@ -1,0 +1,17 @@
+server_addr = "127.0.0.1"
+server_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "tcp"
+
+[[proxies]]
+name = "xtcp_demo"
+type = "xtcp"
+local_ip = "127.0.0.1"
+local_port = 22
+sk = "xtcp_shared_secret"

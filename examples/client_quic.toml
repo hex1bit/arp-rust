@@ -1,0 +1,22 @@
+server_addr = "your.server.name"
+server_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "quic"
+pool_count = 1
+
+[transport.tls]
+trusted_ca_file = "/path/to/ca-or-server-cert.pem"
+server_name = "your.server.name"
+
+[[proxies]]
+name = "quic_ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 6001

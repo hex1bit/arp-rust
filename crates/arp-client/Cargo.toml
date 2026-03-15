@@ -1,0 +1,36 @@
+[package]
+name = "arp-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arpc"
+path = "src/main.rs"
+
+[dependencies]
+arp-common = { path = "../arp-common" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+hostname = "0.4"
+whoami = "1.4"
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio_kcp = { workspace = true }
+quinn = { workspace = true }

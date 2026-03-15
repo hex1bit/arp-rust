@@ -1,0 +1,20 @@
+/target/
+/dist/
+/.cargo-target/
+/.cargo-target*/
+/.cargo-tmp/
+/.tmpcheck/
+/.intentionally-empty-file.o
+/.private/
+
+# macOS
+.DS_Store
+._*
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# Editor and OS artifacts
+Thumbs.db

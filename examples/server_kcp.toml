@@ -1,0 +1,15 @@
+bind_addr = "0.0.0.0"
+bind_port = 17000
+kcp_bind_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "kcp"
+
+[[allow_ports]]
+start = 6001
+end = 7000

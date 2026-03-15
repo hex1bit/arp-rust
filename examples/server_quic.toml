@@ -1,0 +1,19 @@
+bind_addr = "0.0.0.0"
+bind_port = 17000
+quic_bind_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "quic"
+
+[transport.tls]
+cert_file = "/path/to/server-cert.pem"
+key_file = "/path/to/server-key.pem"
+
+[[allow_ports]]
+start = 6001
+end = 7000
