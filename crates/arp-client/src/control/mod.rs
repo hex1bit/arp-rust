@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::{net::ToSocketAddrs, time::Duration};
 
@@ -14,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use arp_common::config::{ClientConfig, VisitorConfig};
 use arp_common::protocol::{
     LoginMsg, LoginRespMsg, Message, NatHoleRespMsg, NatHoleVisitorMsg, NewProxyMsg,
-    NewProxyRespMsg, PongMsg,
+    NewProxyRespMsg, PingMsg, PongMsg,
 };
 use arp_common::transport::quic_stream::QuicBiStream;
 use arp_common::transport::ws_stream::websocket_to_stream;
@@ -22,6 +23,62 @@ use arp_common::transport::MessageTransport;
 use arp_common::{Error, Result};
 
 use crate::proxy::ProxyManager;
+
+/// Pre-built transport configuration to avoid rebuilding TLS context on every work connection.
+#[derive(Clone)]
+enum CachedTransportConfig {
+    /// Plain TCP (no TLS, no WS)
+    PlainTcp,
+    /// TCP + TLS
+    Tls {
+        connector: TlsConnector,
+        server_name: rustls::pki_types::ServerName<'static>,
+    },
+    /// WebSocket (plain)
+    Ws,
+    /// WebSocket + TLS (WSS)
+    Wss {
+        connector: TlsConnector,
+        server_name: rustls::pki_types::ServerName<'static>,
+    },
+    /// KCP (no TLS context needed)
+    Kcp,
+    /// QUIC
+    Quic(QuicClientConfig),
+}
+
+impl CachedTransportConfig {
+    fn build(config: &ClientConfig) -> Result<Self> {
+        match config.transport.protocol.as_str() {
+            "kcp" => Ok(Self::Kcp),
+            "quic" => Ok(Self::Quic(build_quic_client_config(config)?)),
+            "websocket" => {
+                if config.transport.tls.enable {
+                    let connector = build_tls_connector(config)?;
+                    let server_name = tls_server_name(config)?;
+                    Ok(Self::Wss {
+                        connector,
+                        server_name,
+                    })
+                } else {
+                    Ok(Self::Ws)
+                }
+            }
+            _ => {
+                if config.transport.tls.enable {
+                    let connector = build_tls_connector(config)?;
+                    let server_name = tls_server_name(config)?;
+                    Ok(Self::Tls {
+                        connector,
+                        server_name,
+                    })
+                } else {
+                    Ok(Self::PlainTcp)
+                }
+            }
+        }
+    }
+}
 
 pub struct Control {
     config: Arc<ClientConfig>,
@@ -31,6 +88,10 @@ pub struct Control {
     cmd_tx: mpsc::Sender<ControlCommand>,
     cmd_rx: tokio::sync::Mutex<mpsc::Receiver<ControlCommand>>,
     pending_xtcp: tokio::sync::Mutex<Option<oneshot::Sender<Result<NatHoleRespMsg>>>>,
+    /// Tracks the last time a Pong was received (or when we connected), as Unix timestamp seconds.
+    last_pong: Arc<AtomicI64>,
+    /// Pre-built transport config (TLS context, etc.) to avoid rebuilding per work connection.
+    cached_transport_config: Arc<CachedTransportConfig>,
 }
 
 enum ControlCommand {
@@ -46,7 +107,8 @@ impl Control {
     pub async fn new(config: Arc<ClientConfig>, proxy_manager: Arc<ProxyManager>) -> Result<Self> {
         let server_addr = format!("{}:{}", config.server_addr, config.server_port);
         info!("Connecting to server: {}", server_addr);
-        let transport = connect_server_transport(&config).await?;
+        let cached_transport_config = Arc::new(CachedTransportConfig::build(&config)?);
+        let transport = connect_server_transport_cached(&config, &cached_transport_config).await?;
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
         Ok(Self {
@@ -57,6 +119,8 @@ impl Control {
             cmd_tx,
             cmd_rx: tokio::sync::Mutex::new(cmd_rx),
             pending_xtcp: tokio::sync::Mutex::new(None),
+            last_pong: Arc::new(AtomicI64::new(chrono::Utc::now().timestamp())),
+            cached_transport_config,
         })
     }
 
@@ -82,6 +146,7 @@ impl Control {
             let config = self.config.clone();
             let proxy_manager = self.proxy_manager.clone();
             let run_id = self.run_id.clone();
+            let cached = self.cached_transport_config.clone();
             tokio::spawn(async move {
                 loop {
                     let current_run_id = run_id.read().await.clone();
@@ -93,13 +158,21 @@ impl Control {
 
                     if let Err(e) = Self::create_work_conn_static(
                         config.clone(),
+                        cached.clone(),
                         proxy_manager.clone(),
                         current_run_id,
                     )
                     .await
                     {
-                        error!("Pooled work connection closed with error: {}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        match e {
+                            Error::ConnectionClosed => {
+                                debug!("Pre-warmed work connection closed, reconnecting...");
+                            }
+                            _ => {
+                                error!("Pooled work connection closed with error: {}", e);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            }
+                        }
                     }
                 }
             });
@@ -418,8 +491,39 @@ impl Control {
     async fn run_message_loop(&self) -> Result<()> {
         info!("Entering message loop...");
 
+        let heartbeat_interval = if self.config.transport.heartbeat_interval > 0 {
+            self.config.transport.heartbeat_interval
+        } else {
+            30
+        };
+        let heartbeat_timeout = if self.config.transport.heartbeat_timeout > 0 {
+            self.config.transport.heartbeat_timeout
+        } else {
+            90
+        };
+
+        let mut heartbeat_ticker =
+            tokio::time::interval(Duration::from_secs(heartbeat_interval));
+        heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = heartbeat_ticker.tick() => {
+                    let now = chrono::Utc::now().timestamp();
+                    let last = self.last_pong.load(Ordering::Relaxed);
+                    if now - last > heartbeat_timeout as i64 {
+                        error!(
+                            "Heartbeat timeout: no Pong received for {} seconds, closing connection",
+                            now - last
+                        );
+                        return Err(Error::Timeout("heartbeat timeout".to_string()));
+                    }
+                    debug!("Sending Ping to server");
+                    self.send_control_message(Message::Ping(PingMsg {
+                        timestamp: now,
+                    }))
+                    .await?;
+                }
                 cmd = self.recv_control_command() => {
                     if let Some(cmd) = cmd {
                         self.handle_control_command(cmd).await?;
@@ -445,6 +549,7 @@ impl Control {
                                 continue;
                             }
                             let config = self.config.clone();
+                            let cached = self.cached_transport_config.clone();
                             let proxy_manager = self.proxy_manager.clone();
                             let run_id = self.run_id.read().await.clone();
                             if run_id.trim().is_empty() {
@@ -453,9 +558,16 @@ impl Control {
                             }
                             tokio::spawn(async move {
                                 if let Err(e) =
-                                    Self::create_work_conn_static(config, proxy_manager, run_id).await
+                                    Self::create_work_conn_static(config, cached, proxy_manager, run_id).await
                                 {
-                                    error!("Failed to create work connection: {}", e);
+                                    match e {
+                                        Error::ConnectionClosed => {
+                                            debug!("Work connection closed before StartWorkConn (pre-warmed connection may have been used instead)");
+                                        }
+                                        _ => {
+                                            error!("Failed to create work connection: {}", e);
+                                        }
+                                    }
                                 }
                             });
                         }
@@ -465,6 +577,11 @@ impl Control {
                                 timestamp: chrono::Utc::now().timestamp(),
                             }))
                             .await?;
+                        }
+                        Message::Pong(pong) => {
+                            debug!("Received Pong (server_ts={})", pong.timestamp);
+                            self.last_pong
+                                .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
                         }
                         Message::NatHoleClient(req) => {
                             debug!(
@@ -568,6 +685,7 @@ impl Control {
 
     async fn create_work_conn_static(
         config: Arc<ClientConfig>,
+        cached: Arc<CachedTransportConfig>,
         proxy_manager: Arc<ProxyManager>,
         run_id: String,
     ) -> Result<()> {
@@ -580,7 +698,7 @@ impl Control {
         debug!("Creating work connection...");
 
         let server_addr = format!("{}:{}", config.server_addr, config.server_port);
-        let mut transport = connect_server_transport(&config).await.map_err(|e| {
+        let mut transport = connect_server_transport_cached(&config, &cached).await.map_err(|e| {
             error!("Failed to connect to server for work conn: {}", e);
             e
         })?;
@@ -627,7 +745,7 @@ impl Control {
                 )));
             }
             None => {
-                error!("Connection closed while waiting for StartWorkConn");
+                debug!("Connection closed while waiting for StartWorkConn");
                 return Err(Error::ConnectionClosed);
             }
         }
@@ -636,105 +754,106 @@ impl Control {
     }
 }
 
-async fn connect_server_transport(config: &ClientConfig) -> Result<MessageTransport> {
-    if config.transport.protocol == "kcp" {
-        let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
-        let stream = KcpStream::connect(&build_kcp_config(), server_addr)
-            .await
-            .map_err(|e| Error::Transport(format!("KCP connect failed: {}", e)))?;
-        return Ok(MessageTransport::from_stream(Box::new(stream)));
-    }
-
-    if config.transport.protocol == "quic" {
-        let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
-        let bind_addr = match server_addr {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-            std::net::SocketAddr::V6(_) => "[::]:0",
-        };
-        let mut endpoint = Endpoint::client(bind_addr.parse().map_err(|e| {
-            Error::Config(format!(
-                "Invalid QUIC client bind address {}: {}",
-                bind_addr, e
-            ))
-        })?)
-        .map_err(Error::Io)?;
-        endpoint.set_default_client_config(build_quic_client_config(config)?);
-
-        let server_name = if !config.transport.tls.server_name.is_empty() {
-            config.transport.tls.server_name.clone()
-        } else if config.server_addr.parse::<std::net::IpAddr>().is_ok() {
-            return Err(Error::Config(
-                "quic transport with IP server_addr requires transport.tls.server_name".to_string(),
-            ));
-        } else {
-            config.server_addr.clone()
-        };
-
-        let conn = endpoint
-            .connect(server_addr, &server_name)
-            .map_err(|e| Error::Transport(format!("QUIC connect init failed: {}", e)))?
-            .await
-            .map_err(|e| Error::Transport(format!("QUIC connect failed: {}", e)))?;
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| Error::Transport(format!("QUIC stream open failed: {}", e)))?;
-        return Ok(MessageTransport::from_stream(Box::new(QuicBiStream::new(
-            recv,
-            send,
-            conn.clone(),
-            Some(endpoint),
-        ))));
-    }
-
-    if config.transport.protocol == "websocket" {
-        let ws_scheme = if config.transport.tls.enable {
-            "wss"
-        } else {
-            "ws"
-        };
-        let ws_url = format!(
-            "{}://{}:{}/ws",
-            ws_scheme, config.server_addr, config.server_port
-        );
-        let stream = TcpStream::connect(format!("{}:{}", config.server_addr, config.server_port))
-            .await
+async fn connect_server_transport_cached(
+    config: &ClientConfig,
+    cached: &CachedTransportConfig,
+) -> Result<MessageTransport> {
+    match cached {
+        CachedTransportConfig::Kcp => {
+            let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
+            let stream = KcpStream::connect(&build_kcp_config(), server_addr)
+                .await
+                .map_err(|e| Error::Transport(format!("KCP connect failed: {}", e)))?;
+            Ok(MessageTransport::from_stream(Box::new(stream)))
+        }
+        CachedTransportConfig::Quic(quic_config) => {
+            let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
+            let bind_addr = match server_addr {
+                std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                std::net::SocketAddr::V6(_) => "[::]:0",
+            };
+            let mut endpoint = Endpoint::client(bind_addr.parse().map_err(|e| {
+                Error::Config(format!(
+                    "Invalid QUIC client bind address {}: {}",
+                    bind_addr, e
+                ))
+            })?)
             .map_err(Error::Io)?;
-        if config.transport.tls.enable {
-            let connector = build_tls_connector(config)?;
-            let server_name = tls_server_name(config)?;
+            endpoint.set_default_client_config(quic_config.clone());
+            let server_name = if !config.transport.tls.server_name.is_empty() {
+                config.transport.tls.server_name.clone()
+            } else {
+                config.server_addr.clone()
+            };
+            let conn = endpoint
+                .connect(server_addr, &server_name)
+                .map_err(|e| Error::Transport(format!("QUIC connect init failed: {}", e)))?
+                .await
+                .map_err(|e| Error::Transport(format!("QUIC connect failed: {}", e)))?;
+            let (send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| Error::Transport(format!("QUIC stream open failed: {}", e)))?;
+            Ok(MessageTransport::from_stream(Box::new(QuicBiStream::new(
+                recv,
+                send,
+                conn.clone(),
+                Some(endpoint),
+            ))))
+        }
+        CachedTransportConfig::Ws => {
+            let ws_url = format!(
+                "ws://{}:{}/ws",
+                config.server_addr, config.server_port
+            );
+            let stream =
+                TcpStream::connect(format!("{}:{}", config.server_addr, config.server_port))
+                    .await
+                    .map_err(Error::Io)?;
+            let (ws, _) = client_async(&ws_url, stream)
+                .await
+                .map_err(|e| Error::Transport(format!("WS handshake failed: {}", e)))?;
+            Ok(MessageTransport::from_stream(websocket_to_stream(ws)))
+        }
+        CachedTransportConfig::Wss {
+            connector,
+            server_name,
+        } => {
+            let ws_url = format!(
+                "wss://{}:{}/ws",
+                config.server_addr, config.server_port
+            );
+            let stream =
+                TcpStream::connect(format!("{}:{}", config.server_addr, config.server_port))
+                    .await
+                    .map_err(Error::Io)?;
             let tls_stream = connector
-                .connect(server_name, stream)
+                .connect(server_name.clone(), stream)
                 .await
                 .map_err(|e| Error::Transport(format!("WSS TLS connect failed: {}", e)))?;
             let (ws, _) = client_async(&ws_url, tls_stream)
                 .await
                 .map_err(|e| Error::Transport(format!("WSS handshake failed: {}", e)))?;
-            return Ok(MessageTransport::from_stream(websocket_to_stream(ws)));
-        } else {
-            let (ws, _) = client_async(&ws_url, stream)
+            Ok(MessageTransport::from_stream(websocket_to_stream(ws)))
+        }
+        CachedTransportConfig::Tls {
+            connector,
+            server_name,
+        } => {
+            let server_addr = format!("{}:{}", config.server_addr, config.server_port);
+            let stream = TcpStream::connect(&server_addr).await.map_err(Error::Io)?;
+            let tls_stream = connector
+                .connect(server_name.clone(), stream)
                 .await
-                .map_err(|e| Error::Transport(format!("WS handshake failed: {}", e)))?;
-            return Ok(MessageTransport::from_stream(websocket_to_stream(ws)));
+                .map_err(|e| Error::Transport(format!("TLS connect failed: {}", e)))?;
+            Ok(MessageTransport::from_stream(Box::new(tls_stream)))
+        }
+        CachedTransportConfig::PlainTcp => {
+            let server_addr = format!("{}:{}", config.server_addr, config.server_port);
+            let stream = TcpStream::connect(&server_addr).await.map_err(Error::Io)?;
+            Ok(MessageTransport::new(stream))
         }
     }
-
-    let server_addr = format!("{}:{}", config.server_addr, config.server_port);
-    let stream = TcpStream::connect(&server_addr).await.map_err(Error::Io)?;
-
-    if !config.transport.tls.enable {
-        return Ok(MessageTransport::new(stream));
-    }
-
-    let connector = build_tls_connector(config)?;
-    let server_name = tls_server_name(config)?;
-
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|e| Error::Transport(format!("TLS connect failed: {}", e)))?;
-
-    Ok(MessageTransport::from_stream(Box::new(tls_stream)))
 }
 
 fn normalize_relay_addr(relay_addr: &str, server_addr: &str) -> String {

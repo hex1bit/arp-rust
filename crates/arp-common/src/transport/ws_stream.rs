@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
 use futures::{SinkExt, StreamExt};
 use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio_tungstenite::{tungstenite::Message as WsMessage, WebSocketStream};
 
 use crate::transport::BoxedStream;
@@ -14,45 +11,33 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (app_stream, bridge_stream) = duplex(BRIDGE_BUF);
-    let (bridge_r, bridge_w) = tokio::io::split(bridge_stream);
-    let bridge_w = Arc::new(Mutex::new(bridge_w));
+    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge_stream);
 
-    let (ws_sink, mut ws_stream) = ws.split();
-    let ws_sink = Arc::new(Mutex::new(ws_sink));
+    let (mut ws_sink, mut ws_stream) = ws.split();
 
-    let ws_sink_send = Arc::clone(&ws_sink);
-    let bridge_w_close = Arc::clone(&bridge_w);
+    // bridge → WebSocket: read from duplex, send as binary WS frames.
+    // No Arc<Mutex> needed: each direction is exclusively owned by one task.
     tokio::spawn(async move {
-        let mut bridge_r = bridge_r;
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             let n = match bridge_r.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = ws_sink_send.lock().await.close().await;
+                Ok(0) | Err(_) => {
+                    let _ = ws_sink.close().await;
                     break;
                 }
                 Ok(n) => n,
-                Err(_) => {
-                    let _ = ws_sink_send.lock().await.close().await;
-                    break;
-                }
             };
-
-            if ws_sink_send
-                .lock()
-                .await
-                .send(WsMessage::Binary(buf[..n].to_vec().into()))
+            if ws_sink
+                .send(WsMessage::Binary(buf[..n].to_vec()))
                 .await
                 .is_err()
             {
                 break;
             }
         }
-
-        let _ = bridge_w_close.lock().await.shutdown().await;
     });
 
-    let bridge_w_recv = Arc::clone(&bridge_w);
+    // WebSocket → bridge: receive WS frames, write payload to duplex.
     tokio::spawn(async move {
         while let Some(frame) = ws_stream.next().await {
             let Ok(frame) = frame else {
@@ -60,21 +45,28 @@ where
             };
             match frame {
                 WsMessage::Binary(data) => {
-                    if bridge_w_recv.lock().await.write_all(&data).await.is_err() {
+                    if bridge_w.write_all(&data).await.is_err() {
                         break;
                     }
                 }
-                WsMessage::Text(_) => {}
-                WsMessage::Ping(_) => {}
+                WsMessage::Text(text) => {
+                    // Treat text frames as raw bytes (protocol fallback).
+                    if bridge_w.write_all(text.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                WsMessage::Ping(_) => {
+                    // tokio-tungstenite automatically queues a Pong reply for us.
+                }
                 WsMessage::Pong(_) => {}
                 WsMessage::Close(_) => {
                     break;
                 }
-                _ => {}
+                WsMessage::Frame(_) => {}
             }
         }
 
-        let _ = bridge_w_recv.lock().await.shutdown().await;
+        let _ = bridge_w.shutdown().await;
     });
 
     Box::new(app_stream)

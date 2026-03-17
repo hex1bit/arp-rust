@@ -8,7 +8,7 @@ echo ""
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_BIN="$PROJECT_DIR/target/debug/arps"
 CLIENT_BIN="$PROJECT_DIR/target/debug/arpc"
-STUB_SRC="$PROJECT_DIR/scripts/tcp_backend_stub.rs"
+STUB_SRC="$PROJECT_DIR/test/support/tcp_backend_stub.rs"
 STUB_BIN="/tmp/tcp_backend_stub"
 TEST_CONTROL_PORT=27150
 BACKEND_PORT=23331
