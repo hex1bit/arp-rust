@@ -305,15 +305,24 @@ impl Service {
             }))
             .await?;
 
+        let heartbeat_timeout = if self.config.transport.heartbeat_timeout > 0 {
+            self.config.transport.heartbeat_timeout
+        } else {
+            90
+        };
+
         let control = Arc::new(
             Control::new(
                 run_id.clone(),
+                login_msg.client_id.clone(),
                 peer_addr.clone(),
                 transport,
                 self.proxy_manager.clone(),
                 self.resource_controller.clone(),
                 self.authenticator.clone(),
+                self.control_manager.clone(),
                 self.nathole.clone(),
+                heartbeat_timeout,
             )
             .await?,
         );

@@ -74,6 +74,9 @@ pub struct ClientConfig {
     pub server_port: u16,
 
     #[serde(default)]
+    pub client_id: String,
+
+    #[serde(default)]
     pub log_level: String,
 
     #[serde(default)]
@@ -608,6 +611,7 @@ mod tests {
         let cfg = ClientConfig {
             server_addr: "example.com".to_string(),
             server_port: 7000,
+            client_id: String::new(),
             log_level: String::new(),
             auth: AuthConfig::default(),
             transport: TransportConfig {
@@ -633,6 +637,7 @@ mod tests {
         let cfg = ClientConfig {
             server_addr: "127.0.0.1".to_string(),
             server_port: 7000,
+            client_id: String::new(),
             log_level: String::new(),
             auth: AuthConfig::default(),
             transport: TransportConfig {

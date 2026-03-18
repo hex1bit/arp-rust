@@ -136,6 +136,21 @@ impl Control {
         Ok(())
     }
 
+    fn effective_client_id(&self) -> String {
+        if !self.config.client_id.trim().is_empty() {
+            return self.config.client_id.trim().to_string();
+        }
+
+        format!(
+            "{}@{}:{}",
+            whoami::username(),
+            hostname::get()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            self.config.server_addr
+        )
+    }
+
     async fn prewarm_work_conn_pool(&self) {
         let pool_count = self.config.transport.pool_count;
         if pool_count == 0 {
@@ -191,6 +206,7 @@ impl Control {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             user: whoami::username(),
+            client_id: self.effective_client_id(),
             timestamp: chrono::Utc::now().timestamp(),
             privilege_key: self.config.auth.token.clone(),
             run_id: String::new(),

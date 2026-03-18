@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use arp_common::protocol::NewProxyMsg;
 use arp_common::transport::MessageTransport;
@@ -249,6 +249,38 @@ impl ProxyManager {
         }
 
         Ok(())
+    }
+
+    /// Evict any existing proxy with the given name (from any run_id).
+    /// Returns the run_id of the evicted proxy's owner if one was found.
+    pub async fn evict_proxy_by_name(&self, proxy_name: &str) -> Option<String> {
+        // Find any existing proxy with this name (format: "{run_id}:{proxy_name}")
+        let existing_key = self.proxies.iter().find_map(|entry| {
+            let key = entry.key();
+            if key.ends_with(&format!(":{}", proxy_name)) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(key) = existing_key {
+            let owner_run_id = key.splitn(2, ':').next().unwrap_or("").to_string();
+            if let Some((_, proxy)) = self.proxies.remove(&key) {
+                warn!(
+                    "Evicting stale proxy {} (owned by run_id {})",
+                    proxy_name, owner_run_id
+                );
+                if let Err(e) = proxy.close().await {
+                    error!("Failed to close evicted proxy {}: {}", key, e);
+                }
+            }
+            // Also clean xtcp registry if applicable
+            self.xtcp_registry.remove(proxy_name);
+            Some(owner_run_id)
+        } else {
+            None
+        }
     }
 
     pub async fn unregister_run_proxies(&self, run_id: &str) -> Result<()> {

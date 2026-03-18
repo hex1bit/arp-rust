@@ -83,6 +83,8 @@ arp-rust/
 
 ## Build
 
+Native build:
+
 ```bash
 cargo build --workspace --release
 ```
@@ -91,6 +93,20 @@ Release binaries:
 
 - `target/release/arps`
 - `target/release/arpc`
+
+Docker one-click Linux build from macOS/Linux:
+
+```bash
+bash scripts/build-linux.sh
+```
+
+Output files:
+
+- `dist/linux-x86_64/arps`
+- `dist/linux-x86_64/arpc`
+- `dist/arp-rust-linux-x86_64.tar.gz`
+
+The Docker workflow builds inside a Linux container, so it avoids the local cross-toolchain issue on macOS.
 
 If you want prepacked release bundles with example configs, place the binaries together with the files under `examples/` and your chosen certificate files.
 
