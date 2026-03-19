@@ -1,0 +1,21 @@
+server_addr = "your.server.name"
+server_port = 17000
+client_id = "https-domain-node-1"
+
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "websocket"
+tcp_mux = true
+pool_count = 1
+
+[[proxies]]
+name = "app_https_domain"
+type = "https"
+local_ip = "127.0.0.1"
+local_port = 8443
+custom_domains = ["secure.example.com"]

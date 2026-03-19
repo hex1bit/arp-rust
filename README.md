@@ -248,6 +248,8 @@ Practical guidance:
 
 ## Example Configs
 
+For a scenario-based configuration guide, see `docs/CONFIGURATION_GUIDE.md`.
+
 General examples:
 
 - `examples/server.toml`
@@ -271,6 +273,14 @@ XTCP:
 
 - `examples/client_xtcp_provider.toml`
 - `examples/client_xtcp_visitor.toml`
+
+Vhost HTTP / HTTPS:
+
+- `examples/server_vhost_http.toml`
+- `examples/server_vhost_https.toml`
+- `examples/client_http_custom_domain.toml`
+- `examples/client_http_subdomain.toml`
+- `examples/client_https_custom_domain.toml`
 
 ## TLS / WSS Certificates
 

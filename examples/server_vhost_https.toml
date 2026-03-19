@@ -1,0 +1,15 @@
+bind_addr = "0.0.0.0"
+bind_port = 17000
+vhost_https_port = 443
+subdomain_host = "example.com"
+
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "websocket"
+tcp_mux = true
+
