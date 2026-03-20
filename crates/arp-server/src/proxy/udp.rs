@@ -144,7 +144,13 @@ impl UdpProxy {
         };
 
         let bind_addr = format!("0.0.0.0:{}", remote_port);
-        let socket = UdpSocket::bind(&bind_addr).await.map_err(Error::Io)?;
+        let socket = match UdpSocket::bind(&bind_addr).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                let _ = resource_controller.release_tcp_port(remote_port).await;
+                return Err(Error::Io(e));
+            }
+        };
         info!("UDP proxy {} listening on {}", msg.proxy_name, bind_addr);
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);

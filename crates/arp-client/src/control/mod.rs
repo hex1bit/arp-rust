@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tokio_kcp::{KcpConfig, KcpNoDelayConfig, KcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async;
@@ -92,6 +93,7 @@ pub struct Control {
     last_pong: Arc<AtomicI64>,
     /// Pre-built transport config (TLS context, etc.) to avoid rebuilding per work connection.
     cached_transport_config: Arc<CachedTransportConfig>,
+    cancel: CancellationToken,
 }
 
 enum ControlCommand {
@@ -121,7 +123,12 @@ impl Control {
             pending_xtcp: tokio::sync::Mutex::new(None),
             last_pong: Arc::new(AtomicI64::new(chrono::Utc::now().timestamp())),
             cached_transport_config,
+            cancel: CancellationToken::new(),
         })
+    }
+
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -131,9 +138,15 @@ impl Control {
         self.start_visitors().await;
         self.prewarm_work_conn_pool().await;
 
-        self.run_message_loop().await?;
-
-        Ok(())
+        let result = self.run_message_loop().await;
+        self.shutdown();
+        *self.run_id.write().await = String::new();
+        if let Some(tx) = self.pending_xtcp.lock().await.take() {
+            let _ = tx.send(Err(Error::Transport(
+                "control shutting down".to_string(),
+            )));
+        }
+        result
     }
 
     fn effective_client_id(&self) -> String {
@@ -162,30 +175,43 @@ impl Control {
             let proxy_manager = self.proxy_manager.clone();
             let run_id = self.run_id.clone();
             let cached = self.cached_transport_config.clone();
+            let cancel = self.cancel.child_token();
             tokio::spawn(async move {
                 loop {
+                    if cancel.is_cancelled() {
+                        debug!("Stopping pooled work connection task");
+                        break;
+                    }
                     let current_run_id = run_id.read().await.clone();
                     if current_run_id.trim().is_empty() {
-                        warn!("Skip pooled work connection because run_id is empty");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => {}
+                        }
                         continue;
                     }
 
-                    if let Err(e) = Self::create_work_conn_static(
+                    let result = Self::create_work_conn_static(
                         config.clone(),
                         cached.clone(),
                         proxy_manager.clone(),
                         current_run_id,
                     )
-                    .await
-                    {
+                    .await;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    if let Err(e) = result {
                         match e {
                             Error::ConnectionClosed => {
                                 debug!("Pre-warmed work connection closed, reconnecting...");
                             }
                             _ => {
                                 error!("Pooled work connection closed with error: {}", e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                tokio::select! {
+                                    _ = cancel.cancelled() => break,
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+                                }
                             }
                         }
                     }
@@ -337,15 +363,20 @@ impl Control {
                 continue;
             }
             let ctrl = Arc::clone(self);
+            let cancel = self.cancel.child_token();
             tokio::spawn(async move {
-                if let Err(e) = ctrl.run_xtcp_visitor(visitor).await {
+                if let Err(e) = ctrl.run_xtcp_visitor(visitor, cancel).await {
                     error!("xtcp visitor task exited: {}", e);
                 }
             });
         }
     }
 
-    async fn run_xtcp_visitor(self: Arc<Self>, visitor: VisitorConfig) -> Result<()> {
+    async fn run_xtcp_visitor(
+        self: Arc<Self>,
+        visitor: VisitorConfig,
+        cancel: CancellationToken,
+    ) -> Result<()> {
         let bind_addr = if visitor.bind_addr.trim().is_empty() {
             "127.0.0.1".to_string()
         } else {
@@ -368,7 +399,14 @@ impl Control {
         );
 
         loop {
-            let (mut inbound, _) = listener.accept().await.map_err(Error::Io)?;
+            let accept_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("XTCP visitor {} shutting down", visitor.name);
+                    return Ok(());
+                }
+                res = listener.accept() => res,
+            };
+            let (mut inbound, _) = accept_result.map_err(Error::Io)?;
             let ctrl = Arc::clone(&self);
             let visitor_cfg = visitor.clone();
             tokio::spawn(async move {

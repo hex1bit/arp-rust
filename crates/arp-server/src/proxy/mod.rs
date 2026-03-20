@@ -31,8 +31,17 @@ pub trait Proxy: Send + Sync {
     fn proxy_type(&self) -> &str;
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct ProxyRecord {
+    pub run_id: String,
+    pub proxy_name: String,
+    pub proxy_type: String,
+    pub remote_addr: String,
+}
+
 pub struct ProxyManager {
     proxies: DashMap<String, Arc<dyn Proxy>>,
+    records: DashMap<String, ProxyRecord>,
     vhost_manager: Arc<VhostManager>,
     tcp_groups: Arc<DashMap<String, Arc<tcp::GroupedTcpProxy>>>,
     xtcp_registry: Arc<DashMap<String, XtcpProxyInfo>>,
@@ -54,6 +63,7 @@ impl ProxyManager {
     ) -> Self {
         Self {
             proxies: DashMap::new(),
+            records: DashMap::new(),
             vhost_manager: Arc::new(VhostManager::new(
                 bind_addr,
                 subdomain_host,
@@ -81,6 +91,8 @@ impl ProxyManager {
             )));
         }
 
+        let proxy_name_meta = msg.proxy_name.clone();
+        let proxy_type_meta = msg.proxy_type.clone();
         let (proxy, remote_addr): (Arc<dyn Proxy>, String) = match msg.proxy_type.as_str() {
             "tcp" | "stcp" => {
                 let (lb_group, lb_group_key) = parse_lb_group(&msg);
@@ -235,6 +247,15 @@ impl ProxyManager {
         });
 
         self.proxies.insert(proxy_key.clone(), proxy.clone());
+        self.records.insert(
+            proxy_key.clone(),
+            ProxyRecord {
+                run_id: run_id.to_string(),
+                proxy_name: proxy_name_meta,
+                proxy_type: proxy_type_meta,
+                remote_addr: remote_addr.clone(),
+            },
+        );
         info!("Proxy registered: {} -> {}", proxy_key, remote_addr);
 
         Ok(remote_addr)
@@ -245,6 +266,7 @@ impl ProxyManager {
 
         if let Some((_, proxy)) = self.proxies.remove(&proxy_key) {
             info!("Unregistering proxy: {}", proxy_key);
+            self.records.remove(&proxy_key);
             proxy.close().await?;
         }
 
@@ -267,6 +289,7 @@ impl ProxyManager {
         if let Some(key) = existing_key {
             let owner_run_id = key.splitn(2, ':').next().unwrap_or("").to_string();
             if let Some((_, proxy)) = self.proxies.remove(&key) {
+                self.records.remove(&key);
                 warn!(
                     "Evicting stale proxy {} (owned by run_id {})",
                     proxy_name, owner_run_id
@@ -300,6 +323,7 @@ impl ProxyManager {
 
         for key in keys {
             if let Some((_, proxy)) = self.proxies.remove(&key) {
+                self.records.remove(&key);
                 info!("Unregistering proxy: {}", key);
                 proxy.close().await?;
             }
@@ -317,6 +341,33 @@ impl ProxyManager {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    pub fn list_records(&self) -> Vec<ProxyRecord> {
+        let mut items: Vec<ProxyRecord> = self.records.iter().map(|entry| entry.value().clone()).collect();
+        items.sort_by(|a, b| a.proxy_name.cmp(&b.proxy_name).then_with(|| a.run_id.cmp(&b.run_id)));
+        items
+    }
+
+    pub fn get_record(&self, proxy_name: &str) -> Option<ProxyRecord> {
+        self.records
+            .iter()
+            .find_map(|entry| {
+                let value = entry.value();
+                if value.proxy_name == proxy_name {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn count_by_type(&self) -> Vec<(String, usize)> {
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for record in self.records.iter() {
+            *counts.entry(record.proxy_type.clone()).or_insert(0) += 1;
+        }
+        counts.into_iter().collect()
     }
 
     pub fn get_xtcp_owner(&self, proxy_name: &str) -> Option<XtcpProxyInfo> {

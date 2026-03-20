@@ -81,6 +81,7 @@ token = "test_token_123456"
 [transport]
 protocol = "quic"
 pool_count = 1
+tcp_mux = false
 
 [transport.tls]
 trusted_ca_file = "/tmp/arp_quic_server_cert.pem"

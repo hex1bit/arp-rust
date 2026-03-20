@@ -109,8 +109,15 @@ if [ "$HEALTHZ" != "ok" ]; then
     exit 1
 fi
 
+READYZ=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/readyz" || true)
+if [[ "$READYZ" != *'"ready":true'* ]]; then
+    echo "✗ Admin readyz failed"
+    echo "$READYZ"
+    exit 1
+fi
+
 METRICS=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/metrics" || true)
-if [[ "$METRICS" != *"arp_active_controls"* ]] || [[ "$METRICS" != *"arp_active_proxies"* ]] || [[ "$METRICS" != *"arp_tcp_proxy_connections_total"* ]]; then
+if [[ "$METRICS" != *"arp_active_controls"* ]] || [[ "$METRICS" != *"arp_active_proxies"* ]] || [[ "$METRICS" != *"arp_tcp_proxy_connections_total"* ]] || [[ "$METRICS" != *"arp_pending_work_connections"* ]]; then
     echo "✗ Admin metrics failed"
     echo "$METRICS"
     exit 1
@@ -123,16 +130,50 @@ if [[ "$DASHBOARD" != *"ARP Dashboard"* ]]; then
 fi
 
 STATUS_JSON=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/status" || true)
-if [[ "$STATUS_JSON" != *"\"status\":\"ok\""* ]]; then
+if [[ "$STATUS_JSON" != *'"status":"ok"'* ]] || [[ "$STATUS_JSON" != *'"transport_protocol":"tcp"'* ]]; then
     echo "✗ Admin status API failed"
     echo "$STATUS_JSON"
     exit 1
 fi
 
 PROXIES_JSON=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/proxies" || true)
-if [[ "$PROXIES_JSON" != *"test_nc"* ]]; then
+if [[ "$PROXIES_JSON" != *"test_nc"* ]] || [[ "$PROXIES_JSON" != *'"proxy_type":"tcp"'* ]]; then
     echo "✗ Admin proxies API failed"
     echo "$PROXIES_JSON"
+    exit 1
+fi
+
+CLIENTS_JSON=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/clients" || true)
+if [[ "$CLIENTS_JSON" != *'"client_id"'* ]] || [[ "$CLIENTS_JSON" != *'"pool_count":1'* ]]; then
+    echo "✗ Admin clients API failed"
+    echo "$CLIENTS_JSON"
+    exit 1
+fi
+
+RUN_ID=$(grep -o 'run_id: [0-9a-f-]*' /tmp/arp_client.log | awk '{print $2}' | tail -n 1)
+if [ -z "$RUN_ID" ]; then
+    echo "✗ could not extract client run_id from log"
+    tail -n 120 /tmp/arp_client.log || true
+    exit 1
+fi
+
+CLIENT_DETAIL=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/clients/$RUN_ID" || true)
+if [[ "$CLIENT_DETAIL" != *'"pending_work_connections"'* ]] || [[ "$CLIENT_DETAIL" != *'"idle_work_connections"'* ]]; then
+    echo "✗ Admin client detail API failed"
+    echo "$CLIENT_DETAIL"
+    exit 1
+fi
+
+SHUTDOWN_JSON=$(curl -s -X POST "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/clients/$RUN_ID/shutdown" || true)
+if [[ "$SHUTDOWN_JSON" != *'"ok":true'* ]]; then
+    echo "✗ Admin shutdown API failed"
+    echo "$SHUTDOWN_JSON"
+    exit 1
+fi
+sleep 1
+if kill -0 $CLIENT_PID 2>/dev/null; then
+    echo "✗ Client should have exited after shutdown request"
+    tail -n 120 /tmp/arp_client.log || true
     exit 1
 fi
 

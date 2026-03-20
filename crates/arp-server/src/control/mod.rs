@@ -13,6 +13,7 @@ use arp_common::protocol::{
 use arp_common::transport::MessageTransport;
 use arp_common::{Error, Result};
 
+use crate::metrics;
 use crate::nathole::NatHoleController;
 use crate::proxy::{ProxyManager, WorkConnRequest};
 use crate::resource::ResourceController;
@@ -21,6 +22,12 @@ pub struct Control {
     run_id: String,
     client_id: String,
     peer_addr: String,
+    privilege_key: String,
+    pool_count: u32,
+    hostname: String,
+    os: String,
+    arch: String,
+    user: String,
     transport: tokio::sync::Mutex<Option<MessageTransport>>,
     proxy_manager: Arc<ProxyManager>,
     resource_controller: Arc<ResourceController>,
@@ -42,6 +49,12 @@ impl Control {
         run_id: String,
         client_id: String,
         peer_addr: String,
+        privilege_key: String,
+        pool_count: u32,
+        hostname: String,
+        os: String,
+        arch: String,
+        user: String,
         transport: MessageTransport,
         proxy_manager: Arc<ProxyManager>,
         resource_controller: Arc<ResourceController>,
@@ -57,6 +70,12 @@ impl Control {
             run_id,
             client_id,
             peer_addr,
+            privilege_key,
+            pool_count,
+            hostname,
+            os,
+            arch,
+            user,
             transport: tokio::sync::Mutex::new(Some(transport)),
             proxy_manager,
             resource_controller,
@@ -85,6 +104,34 @@ impl Control {
 
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    pub fn os(&self) -> &str {
+        &self.os
+    }
+
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    pub fn pool_count(&self) -> u32 {
+        self.pool_count
+    }
+
+    pub async fn idle_work_conn_count(&self) -> usize {
+        self.idle_work_conns.lock().await.len()
+    }
+
+    pub async fn pending_work_conn_count(&self) -> usize {
+        self.pending_work_conns.lock().await.len()
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -202,11 +249,13 @@ impl Control {
             "Received work connection request for run_id: {}",
             self.run_id
         );
+        metrics::inc_req_work_conn();
 
         if let Some(idle_conn) = {
             let mut idle = self.idle_work_conns.lock().await;
             idle.pop()
         } {
+            metrics::inc_idle_work_conn_hits();
             work_conn_req
                 .reply_tx
                 .send(idle_conn)
@@ -269,6 +318,19 @@ impl Control {
             }
         }
 
+        let auth_result = self
+            .authenticator
+            .authorize_proxy(&self.privilege_key, self.pool_count, &msg);
+        if let Err(e) = auth_result {
+            metrics::inc_auth_failures();
+            let resp = NewProxyRespMsg {
+                proxy_name: msg.proxy_name.clone(),
+                remote_addr: String::new(),
+                error: e.to_string(),
+            };
+            return transport.send(Message::NewProxyResp(resp)).await;
+        }
+
         let result = self
             .proxy_manager
             .register_proxy(
@@ -280,12 +342,16 @@ impl Control {
             .await;
 
         let resp = match result {
-            Ok(remote_addr) => NewProxyRespMsg {
+            Ok(remote_addr) => {
+                metrics::inc_proxy_registrations();
+                NewProxyRespMsg {
                 proxy_name: msg.proxy_name.clone(),
                 remote_addr,
                 error: String::new(),
+            }
             },
             Err(e) => {
+                metrics::inc_proxy_registration_failures();
                 error!("Failed to register proxy {}: {}", msg.proxy_name, e);
                 NewProxyRespMsg {
                     proxy_name: msg.proxy_name.clone(),
@@ -371,6 +437,18 @@ impl Control {
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct ControlRecord {
+    pub run_id: String,
+    pub client_id: String,
+    pub peer_addr: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub user: String,
+    pub pool_count: u32,
+}
+
 pub struct ControlManager {
     controls: DashMap<String, Arc<Control>>,
 }
@@ -430,6 +508,63 @@ impl ControlManager {
 
     pub fn count(&self) -> usize {
         self.controls.len()
+    }
+
+    pub fn list_controls(&self) -> Vec<ControlRecord> {
+        let mut items: Vec<ControlRecord> = self
+            .controls
+            .iter()
+            .map(|entry| {
+                let control = entry.value();
+                ControlRecord {
+                    run_id: control.run_id().to_string(),
+                    client_id: control.client_id().to_string(),
+                    peer_addr: control.peer_addr().to_string(),
+                    hostname: control.hostname().to_string(),
+                    os: control.os().to_string(),
+                    arch: control.arch().to_string(),
+                    user: control.user().to_string(),
+                    pool_count: control.pool_count(),
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        items
+    }
+
+    pub fn get_control_record(&self, run_id: &str) -> Option<ControlRecord> {
+        self.controls.get(run_id).map(|entry| {
+            let control = entry.value();
+            ControlRecord {
+                run_id: control.run_id().to_string(),
+                client_id: control.client_id().to_string(),
+                peer_addr: control.peer_addr().to_string(),
+                hostname: control.hostname().to_string(),
+                os: control.os().to_string(),
+                arch: control.arch().to_string(),
+                user: control.user().to_string(),
+                pool_count: control.pool_count(),
+            }
+        })
+    }
+
+    pub async fn get_control_queue_stats(&self, run_id: &str) -> Option<(usize, usize)> {
+        let control = self.controls.get(run_id).map(|entry| entry.clone())?;
+        Some((
+            control.pending_work_conn_count().await,
+            control.idle_work_conn_count().await,
+        ))
+    }
+
+    pub async fn get_queue_stats_snapshot(&self) -> (usize, usize) {
+        let controls: Vec<Arc<Control>> = self.controls.iter().map(|entry| entry.clone()).collect();
+        let mut pending = 0usize;
+        let mut idle = 0usize;
+        for control in controls {
+            pending += control.pending_work_conn_count().await;
+            idle += control.idle_work_conn_count().await;
+        }
+        (pending, idle)
     }
 
     pub async fn send_message(&self, run_id: &str, msg: Message) -> Result<()> {

@@ -149,7 +149,13 @@ impl TcpProxy {
         };
 
         let bind_addr = format!("0.0.0.0:{}", remote_port);
-        let listener = TcpListener::bind(&bind_addr).await.map_err(Error::Io)?;
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = resource_controller.release_tcp_port(remote_port).await;
+                return Err(Error::Io(e));
+            }
+        };
 
         info!("TCP proxy {} listening on {}", msg.proxy_name, bind_addr);
 
@@ -357,7 +363,13 @@ impl GroupedTcpProxy {
     ) -> Result<Self> {
         let remote_port = resource_controller.allocate_tcp_port(remote_port).await?;
         let bind_addr = format!("0.0.0.0:{}", remote_port);
-        let listener = TcpListener::bind(&bind_addr).await.map_err(Error::Io)?;
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = resource_controller.release_tcp_port(remote_port).await;
+                return Err(Error::Io(e));
+            }
+        };
         info!("TCP group {} listening on {}", group_id, bind_addr);
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let (close_done_tx, close_done_rx) = watch::channel(false);
