@@ -351,28 +351,13 @@ If `nc -vz your.server.name 6001` succeeds but application traffic still fails, 
 
 ## Tests
 
-Unit tests:
+Full test suite (unit + all E2E):
 
 ```bash
-cargo test --workspace
+bash scripts/test-full.sh
 ```
 
-End-to-end tests:
-
-```bash
-bash test/test_e2e.sh
-bash test/test_e2e_tcp_mux.sh
-bash test/test_e2e_vhost.sh
-bash test/test_e2e_udp.sh
-bash test/test_e2e_stcp_sudp.sh
-bash test/test_e2e_tcp_lb_health.sh
-bash test/test_e2e_xtcp.sh
-bash test/test_e2e_ws.sh
-bash test/test_e2e_wss.sh
-bash test/test_e2e_tls.sh
-bash test/test_e2e_kcp.sh
-bash test/test_e2e_quic.sh
-```
+Individual tests are also available under `test/` if you want to run a specific scenario.
 
 ## Admin Endpoints
 

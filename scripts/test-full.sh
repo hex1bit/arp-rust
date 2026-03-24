@@ -28,6 +28,7 @@ run_test "test_e2e_tcp_mux.sh" bash test/test_e2e_tcp_mux.sh
 run_test "test_e2e_tcp_lb_health.sh" bash test/test_e2e_tcp_lb_health.sh
 run_test "test_e2e_vhost.sh" bash test/test_e2e_vhost.sh
 run_test "test_e2e_xtcp.sh" bash test/test_e2e_xtcp.sh
+run_test "test_e2e_tls.sh" bash test/test_e2e_tls.sh
 run_test "test_e2e_health.sh" bash test/test_e2e_health.sh
 run_test "test_e2e_auth_acl.sh" bash test/test_e2e_auth_acl.sh
 
