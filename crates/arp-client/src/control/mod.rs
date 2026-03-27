@@ -108,8 +108,16 @@ enum ControlCommand {
 impl Control {
     pub async fn new(config: Arc<ClientConfig>, proxy_manager: Arc<ProxyManager>) -> Result<Self> {
         let server_addr = format!("{}:{}", config.server_addr, config.server_port);
-        info!("Connecting to server: {}", server_addr);
         let cached_transport_config = Arc::new(CachedTransportConfig::build(&config)?);
+        let transport_label = match cached_transport_config.as_ref() {
+            CachedTransportConfig::PlainTcp => "tcp (plaintext)",
+            CachedTransportConfig::Tls { .. } => "tcp+tls",
+            CachedTransportConfig::Ws => "ws (plaintext websocket)",
+            CachedTransportConfig::Wss { .. } => "wss (websocket+tls)",
+            CachedTransportConfig::Kcp => "kcp",
+            CachedTransportConfig::Quic(_) => "quic+tls",
+        };
+        info!("Connecting to server: {} via {}", server_addr, transport_label);
         let transport = connect_server_transport_cached(&config, &cached_transport_config).await?;
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
