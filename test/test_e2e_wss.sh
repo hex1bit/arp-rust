@@ -81,6 +81,7 @@ token = "test_token_123456"
 [transport]
 protocol = "websocket"
 pool_count = 1
+tcp_mux = false
 
 [transport.tls]
 enable = true

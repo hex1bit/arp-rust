@@ -1,12 +1,15 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use arp_common::protocol::{Message, NatHoleClientMsg, NatHoleRespMsg, NatHoleVisitorMsg};
 use arp_common::{Error, Result};
 
 use crate::control::ControlManager;
+use crate::metrics;
 use crate::proxy::ProxyManager;
 
 struct PendingNatVisitor {
@@ -15,10 +18,23 @@ struct PendingNatVisitor {
     relay_addr: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct XtcpEvent {
+    pub stage: String,
+    pub proxy_name: String,
+    pub visitor_run_id: String,
+    pub owner_run_id: String,
+    pub visitor_addr: String,
+    pub client_addr: String,
+    pub relay_addr: String,
+    pub error: String,
+}
+
 pub struct NatHoleController {
     control_manager: Arc<ControlManager>,
     proxy_manager: Arc<ProxyManager>,
     pending: DashMap<String, PendingNatVisitor>,
+    recent_events: Mutex<VecDeque<XtcpEvent>>,
 }
 
 impl NatHoleController {
@@ -27,6 +43,7 @@ impl NatHoleController {
             control_manager,
             proxy_manager,
             pending: DashMap::new(),
+            recent_events: Mutex::new(VecDeque::with_capacity(32)),
         }
     }
 
@@ -35,11 +52,24 @@ impl NatHoleController {
         visitor_run_id: &str,
         msg: NatHoleVisitorMsg,
     ) -> Result<Option<NatHoleRespMsg>> {
+        metrics::inc_xtcp_visitor_requests();
         let (signed_sk, mut visitor_addr) = parse_signed_msg(&msg.signed_msg)?;
         if let Some(visitor_peer) = self.control_manager.peer_addr(visitor_run_id) {
             visitor_addr = normalize_endpoint_addr(&visitor_addr, &visitor_peer);
         }
         let Some(owner) = self.proxy_manager.get_xtcp_owner(&msg.proxy_name) else {
+            metrics::inc_xtcp_owner_not_found();
+            self.push_event(XtcpEvent {
+                stage: "owner_not_found".to_string(),
+                proxy_name: msg.proxy_name.clone(),
+                visitor_run_id: visitor_run_id.to_string(),
+                owner_run_id: String::new(),
+                visitor_addr: visitor_addr.clone(),
+                client_addr: String::new(),
+                relay_addr: String::new(),
+                error: format!("xtcp proxy {} not found", msg.proxy_name),
+            })
+            .await;
             return Ok(Some(NatHoleRespMsg {
                 visitor_addr,
                 client_addr: String::new(),
@@ -49,6 +79,18 @@ impl NatHoleController {
         };
 
         if owner.sk != signed_sk {
+            metrics::inc_xtcp_sk_mismatch();
+            self.push_event(XtcpEvent {
+                stage: "sk_mismatch".to_string(),
+                proxy_name: msg.proxy_name.clone(),
+                visitor_run_id: visitor_run_id.to_string(),
+                owner_run_id: owner.run_id.clone(),
+                visitor_addr: visitor_addr.clone(),
+                client_addr: String::new(),
+                relay_addr: owner.relay_addr.clone(),
+                error: "xtcp sk mismatch".to_string(),
+            })
+            .await;
             return Ok(Some(NatHoleRespMsg {
                 visitor_addr,
                 client_addr: String::new(),
@@ -67,8 +109,8 @@ impl NatHoleController {
         );
 
         let req = NatHoleClientMsg {
-            proxy_name: msg.proxy_name,
-            visitor_addr,
+            proxy_name: msg.proxy_name.clone(),
+            visitor_addr: visitor_addr.clone(),
         };
 
         if let Err(e) = self
@@ -76,6 +118,18 @@ impl NatHoleController {
             .send_message(&owner.run_id, Message::NatHoleClient(req))
             .await
         {
+            metrics::inc_xtcp_owner_offline();
+            self.push_event(XtcpEvent {
+                stage: "owner_offline".to_string(),
+                proxy_name: msg.proxy_name.clone(),
+                visitor_run_id: visitor_run_id.to_string(),
+                owner_run_id: owner.run_id.clone(),
+                visitor_addr: visitor_addr.clone(),
+                client_addr: String::new(),
+                relay_addr: owner.relay_addr.clone(),
+                error: format!("owner client offline: {}", e),
+            })
+            .await;
             warn!("failed to forward NatHoleClient to owner: {}", e);
             return Ok(Some(NatHoleRespMsg {
                 visitor_addr: String::new(),
@@ -84,6 +138,19 @@ impl NatHoleController {
                 error: "owner client offline".to_string(),
             }));
         }
+
+        metrics::inc_xtcp_owner_requests_forwarded();
+        self.push_event(XtcpEvent {
+            stage: "visitor_forwarded".to_string(),
+            proxy_name: msg.proxy_name,
+            visitor_run_id: visitor_run_id.to_string(),
+            owner_run_id: owner.run_id,
+            visitor_addr,
+            client_addr: String::new(),
+            relay_addr: owner.relay_addr,
+            error: String::new(),
+        })
+        .await;
 
         Ok(None)
     }
@@ -115,12 +182,41 @@ impl NatHoleController {
             pending.proxy_name, pending.visitor_run_id
         );
         if msg.relay_addr.is_empty() {
-            msg.relay_addr = pending.relay_addr;
+            msg.relay_addr = pending.relay_addr.clone();
         }
+
+        metrics::inc_xtcp_responses_forwarded();
+        self.push_event(XtcpEvent {
+            stage: if msg.error.is_empty() {
+                "response_forwarded".to_string()
+            } else {
+                "response_error".to_string()
+            },
+            proxy_name: pending.proxy_name.clone(),
+            visitor_run_id: pending.visitor_run_id.clone(),
+            owner_run_id: owner_run_id.to_string(),
+            visitor_addr: msg.visitor_addr.clone(),
+            client_addr: msg.client_addr.clone(),
+            relay_addr: msg.relay_addr.clone(),
+            error: msg.error.clone(),
+        })
+        .await;
 
         self.control_manager
             .send_message(&pending.visitor_run_id, Message::NatHoleResp(msg))
             .await
+    }
+
+    pub async fn recent_events(&self) -> Vec<XtcpEvent> {
+        self.recent_events.lock().await.iter().cloned().collect()
+    }
+
+    async fn push_event(&self, event: XtcpEvent) {
+        let mut events = self.recent_events.lock().await;
+        if events.len() >= 32 {
+            events.pop_front();
+        }
+        events.push_back(event);
     }
 }
 

@@ -74,6 +74,9 @@ pub struct ClientConfig {
     pub server_port: u16,
 
     #[serde(default)]
+    pub client_id: String,
+
+    #[serde(default)]
     pub log_level: String,
 
     #[serde(default)]
@@ -108,6 +111,12 @@ pub struct AuthConfig {
 
     #[serde(default)]
     pub token: String,
+
+    #[serde(default)]
+    pub additional_tokens: Vec<String>,
+
+    #[serde(default)]
+    pub rules: Vec<AuthRule>,
 
     #[serde(default)]
     pub oidc: OidcConfig,
@@ -328,6 +337,27 @@ pub struct PortRange {
     pub single: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthRule {
+    #[serde(default)]
+    pub token: String,
+
+    #[serde(default)]
+    pub allow_proxy_types: Vec<String>,
+
+    #[serde(default)]
+    pub allow_ports: Vec<PortRange>,
+
+    #[serde(default)]
+    pub allow_domain_suffixes: Vec<String>,
+
+    #[serde(default)]
+    pub allow_subdomain_prefixes: Vec<String>,
+
+    #[serde(default)]
+    pub max_pool_count: u32,
+}
+
 impl ServerConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -341,6 +371,7 @@ impl ServerConfig {
         if self.bind_port == 0 {
             return Err(Error::Config("bind_port cannot be 0".to_string()));
         }
+        self.auth.validate()?;
         match self.transport.protocol.as_str() {
             "tcp" | "kcp" | "quic" | "websocket" => {}
             other => {
@@ -384,6 +415,7 @@ impl ClientConfig {
         if self.server_addr.is_empty() {
             return Err(Error::Config("server_addr cannot be empty".to_string()));
         }
+        self.auth.validate()?;
         if self.server_port == 0 {
             return Err(Error::Config("server_port cannot be 0".to_string()));
         }
@@ -428,6 +460,36 @@ impl ClientConfig {
             proxy.validate()?;
         }
         Ok(())
+    }
+}
+
+impl AuthConfig {
+    pub fn validate(&self) -> Result<()> {
+        match self.method.as_str() {
+            "token" => {
+                if self.token.trim().is_empty()
+                    && self.additional_tokens.is_empty()
+                    && self.rules.is_empty()
+                {
+                    return Err(Error::Config(
+                        "token auth requires token, additional_tokens, or rules".to_string(),
+                    ));
+                }
+                for (idx, rule) in self.rules.iter().enumerate() {
+                    if rule.token.trim().is_empty() {
+                        return Err(Error::Config(format!(
+                            "auth.rules[{}].token cannot be empty",
+                            idx
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            other => Err(Error::Config(format!(
+                "unsupported auth.method: {}",
+                other
+            ))),
+        }
     }
 }
 
@@ -608,6 +670,7 @@ mod tests {
         let cfg = ClientConfig {
             server_addr: "example.com".to_string(),
             server_port: 7000,
+            client_id: String::new(),
             log_level: String::new(),
             auth: AuthConfig::default(),
             transport: TransportConfig {
@@ -633,6 +696,7 @@ mod tests {
         let cfg = ClientConfig {
             server_addr: "127.0.0.1".to_string(),
             server_port: 7000,
+            client_id: String::new(),
             log_level: String::new(),
             auth: AuthConfig::default(),
             transport: TransportConfig {

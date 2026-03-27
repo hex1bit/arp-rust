@@ -37,7 +37,7 @@ pub struct Service {
 
 impl Service {
     pub async fn new(config: ServerConfig) -> Result<Self> {
-        let authenticator = create_authenticator(&config.auth);
+        let authenticator = create_authenticator(&config.auth)?;
         let control_manager = Arc::new(ControlManager::new());
         let proxy_manager = Arc::new(ProxyManager::new(
             config.bind_addr.clone(),
@@ -80,7 +80,14 @@ impl Service {
                 AdminState {
                     control_manager: self.control_manager.clone(),
                     proxy_manager: self.proxy_manager.clone(),
+                    nathole: self.nathole.clone(),
                     started_at_unix: chrono::Utc::now().timestamp(),
+                    transport_protocol: self.config.transport.protocol.clone(),
+                    bind_addr: self.config.bind_addr.clone(),
+                    bind_port: self.config.bind_port,
+                    dashboard_enabled: true,
+                    vhost_http_port: self.config.vhost_http_port,
+                    vhost_https_port: self.config.vhost_https_port,
                 },
             );
         }
@@ -283,6 +290,7 @@ impl Service {
         );
 
         if let Err(e) = self.authenticator.verify_login(&login_msg) {
+            metrics::inc_auth_failures();
             error!("Authentication failed for {}: {}", peer_addr, e);
             transport
                 .send(Message::LoginResp(LoginRespMsg {
@@ -305,15 +313,30 @@ impl Service {
             }))
             .await?;
 
+        let heartbeat_timeout = if self.config.transport.heartbeat_timeout > 0 {
+            self.config.transport.heartbeat_timeout
+        } else {
+            90
+        };
+
         let control = Arc::new(
             Control::new(
                 run_id.clone(),
+                login_msg.client_id.clone(),
                 peer_addr.clone(),
+                login_msg.privilege_key.clone(),
+                login_msg.pool_count,
+                login_msg.hostname.clone(),
+                login_msg.os.clone(),
+                login_msg.arch.clone(),
+                login_msg.user.clone(),
                 transport,
                 self.proxy_manager.clone(),
                 self.resource_controller.clone(),
                 self.authenticator.clone(),
+                self.control_manager.clone(),
                 self.nathole.clone(),
+                heartbeat_timeout,
             )
             .await?,
         );
@@ -343,6 +366,7 @@ impl Service {
         metrics::inc_work_connections();
 
         if let Err(e) = self.authenticator.verify_new_work_conn(&work_conn_msg) {
+            metrics::inc_auth_failures();
             error!(
                 "Work connection authentication failed for run_id {}: {}",
                 work_conn_msg.run_id, e

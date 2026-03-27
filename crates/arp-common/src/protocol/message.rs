@@ -71,6 +71,8 @@ pub struct LoginMsg {
     pub arch: String,
     #[serde(default)]
     pub user: String,
+    #[serde(default)]
+    pub client_id: String,
     pub timestamp: i64,
     #[serde(default)]
     pub privilege_key: String,

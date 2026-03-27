@@ -83,6 +83,8 @@ arp-rust/
 
 ## Build
 
+Native build:
+
 ```bash
 cargo build --workspace --release
 ```
@@ -91,6 +93,20 @@ Release binaries:
 
 - `target/release/arps`
 - `target/release/arpc`
+
+Docker one-click Linux build from macOS/Linux:
+
+```bash
+bash scripts/build-linux.sh
+```
+
+Output files:
+
+- `dist/linux-x86_64/arps`
+- `dist/linux-x86_64/arpc`
+- `dist/arp-rust-linux-x86_64.tar.gz`
+
+The Docker workflow builds inside a Linux container, so it avoids the local cross-toolchain issue on macOS.
 
 If you want prepacked release bundles with example configs, place the binaries together with the files under `examples/` and your chosen certificate files.
 
@@ -232,6 +248,8 @@ Practical guidance:
 
 ## Example Configs
 
+For a scenario-based configuration guide, see `docs/CONFIGURATION_GUIDE.md`.
+
 General examples:
 
 - `examples/server.toml`
@@ -255,6 +273,14 @@ XTCP:
 
 - `examples/client_xtcp_provider.toml`
 - `examples/client_xtcp_visitor.toml`
+
+Vhost HTTP / HTTPS:
+
+- `examples/server_vhost_http.toml`
+- `examples/server_vhost_https.toml`
+- `examples/client_http_custom_domain.toml`
+- `examples/client_http_subdomain.toml`
+- `examples/client_https_custom_domain.toml`
 
 ## TLS / WSS Certificates
 
@@ -325,28 +351,13 @@ If `nc -vz your.server.name 6001` succeeds but application traffic still fails, 
 
 ## Tests
 
-Unit tests:
+Full test suite (unit + all E2E):
 
 ```bash
-cargo test --workspace
+bash scripts/test-full.sh
 ```
 
-End-to-end tests:
-
-```bash
-bash test/test_e2e.sh
-bash test/test_e2e_tcp_mux.sh
-bash test/test_e2e_vhost.sh
-bash test/test_e2e_udp.sh
-bash test/test_e2e_stcp_sudp.sh
-bash test/test_e2e_tcp_lb_health.sh
-bash test/test_e2e_xtcp.sh
-bash test/test_e2e_ws.sh
-bash test/test_e2e_wss.sh
-bash test/test_e2e_tls.sh
-bash test/test_e2e_kcp.sh
-bash test/test_e2e_quic.sh
-```
+Individual tests are also available under `test/` if you want to run a specific scenario.
 
 ## Admin Endpoints
 

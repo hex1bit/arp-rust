@@ -105,6 +105,7 @@ mod tests {
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             user: "test-user".to_string(),
+            client_id: "client-a".to_string(),
             timestamp: 1234567890,
             privilege_key: "test-key".to_string(),
             run_id: "".to_string(),

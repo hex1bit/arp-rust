@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
 use arp_common::crypto::PacketCipher;
@@ -25,10 +25,12 @@ const BACKEND_FAIL_THRESHOLD: u32 = 1;
 pub struct TcpProxy {
     name: String,
     remote_port: u16,
-    listener: TcpListener,
+    listener: Mutex<Option<TcpListener>>,
     resource_controller: Arc<ResourceController>,
     work_conn_req_tx: mpsc::Sender<WorkConnRequest>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    close_done_tx: watch::Sender<bool>,
+    close_done_rx: watch::Receiver<bool>,
     tcp_mux: bool,
     stcp: bool,
     secret: String,
@@ -147,11 +149,18 @@ impl TcpProxy {
         };
 
         let bind_addr = format!("0.0.0.0:{}", remote_port);
-        let listener = TcpListener::bind(&bind_addr).await.map_err(Error::Io)?;
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = resource_controller.release_tcp_port(remote_port).await;
+                return Err(Error::Io(e));
+            }
+        };
 
         info!("TCP proxy {} listening on {}", msg.proxy_name, bind_addr);
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (close_done_tx, close_done_rx) = watch::channel(false);
         let tcp_mux = matches!(
             msg.multiplexer.as_str(),
             "tcp_mux" | "mux" | "smux" | "yamux"
@@ -160,10 +169,12 @@ impl TcpProxy {
         Ok(Self {
             name: msg.proxy_name,
             remote_port,
-            listener,
+            listener: Mutex::new(Some(listener)),
             resource_controller,
             work_conn_req_tx,
             shutdown_tx,
+            close_done_tx,
+            close_done_rx,
             tcp_mux,
             stcp,
             secret: msg.sk,
@@ -179,11 +190,17 @@ impl TcpProxy {
 #[async_trait]
 impl Proxy for TcpProxy {
     async fn run(&self) -> Result<()> {
+        let listener = {
+            let mut guard = self.listener.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| Error::Transport(format!("TCP proxy {} listener already taken", self.name)))?
+        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
-                result = self.listener.accept() => {
+                result = listener.accept() => {
                     match result {
                         Ok((client_stream, addr)) => {
                             let client_addr = addr.to_string();
@@ -234,12 +251,26 @@ impl Proxy for TcpProxy {
             }
         }
 
+        let _ = self.close_done_tx.send(true);
         Ok(())
     }
 
     async fn close(&self) -> Result<()> {
         let _ = self.shutdown_tx.send(());
         self.mux_tunnel.lock().await.take();
+
+        if !*self.close_done_rx.borrow() {
+            let mut close_done_rx = self.close_done_rx.clone();
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), async move {
+                while !*close_done_rx.borrow_and_update() {
+                    if close_done_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
         self.resource_controller
             .release_tcp_port(self.remote_port)
             .await?;
@@ -314,9 +345,11 @@ struct GroupedBackendState {
 pub struct GroupedTcpProxy {
     group_id: String,
     remote_port: u16,
-    listener: TcpListener,
+    listener: Mutex<Option<TcpListener>>,
     resource_controller: Arc<ResourceController>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    close_done_tx: watch::Sender<bool>,
+    close_done_rx: watch::Receiver<bool>,
     started: AtomicBool,
     rr: AtomicU32,
     backends: Arc<Mutex<Vec<GroupedBackendState>>>,
@@ -330,15 +363,24 @@ impl GroupedTcpProxy {
     ) -> Result<Self> {
         let remote_port = resource_controller.allocate_tcp_port(remote_port).await?;
         let bind_addr = format!("0.0.0.0:{}", remote_port);
-        let listener = TcpListener::bind(&bind_addr).await.map_err(Error::Io)?;
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = resource_controller.release_tcp_port(remote_port).await;
+                return Err(Error::Io(e));
+            }
+        };
         info!("TCP group {} listening on {}", group_id, bind_addr);
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (close_done_tx, close_done_rx) = watch::channel(false);
         Ok(Self {
             group_id,
             remote_port,
-            listener,
+            listener: Mutex::new(Some(listener)),
             resource_controller,
             shutdown_tx,
+            close_done_tx,
+            close_done_rx,
             started: AtomicBool::new(false),
             rr: AtomicU32::new(0),
             backends: Arc::new(Mutex::new(Vec::new())),
@@ -392,6 +434,17 @@ impl GroupedTcpProxy {
         drop(backends);
         if empty {
             let _ = self.shutdown_tx.send(());
+            if !*self.close_done_rx.borrow() {
+                let mut close_done_rx = self.close_done_rx.clone();
+                let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), async move {
+                    while !*close_done_rx.borrow_and_update() {
+                        if close_done_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            }
             self.resource_controller
                 .release_tcp_port(self.remote_port)
                 .await?;
@@ -400,10 +453,16 @@ impl GroupedTcpProxy {
     }
 
     async fn run_loop(self: Arc<Self>) -> Result<()> {
+        let listener = {
+            let mut guard = self.listener.lock().await;
+            guard.take().ok_or_else(|| {
+                Error::Transport(format!("TCP group {} listener already taken", self.group_id))
+            })?
+        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
-                res = self.listener.accept() => {
+                res = listener.accept() => {
                     let (client_stream, addr) = res.map_err(Error::Io)?;
                     let this = self.clone();
                     tokio::spawn(async move {
@@ -419,6 +478,7 @@ impl GroupedTcpProxy {
                 }
             }
         }
+        let _ = self.close_done_tx.send(true);
         Ok(())
     }
 

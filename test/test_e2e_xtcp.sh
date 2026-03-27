@@ -8,11 +8,12 @@ echo ""
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_BIN="$PROJECT_DIR/target/debug/arps"
 CLIENT_BIN="$PROJECT_DIR/target/debug/arpc"
-STUB_SRC="$PROJECT_DIR/scripts/tcp_backend_stub.rs"
+STUB_SRC="$PROJECT_DIR/test/support/tcp_backend_stub.rs"
 STUB_BIN="/tmp/tcp_backend_stub"
 TEST_CONTROL_PORT=27150
 BACKEND_PORT=23331
 VISITOR_BIND_PORT=26331
+TEST_DASHBOARD_PORT=27550
 
 cleanup() {
   echo "Cleaning up..."
@@ -40,6 +41,8 @@ echo "2. Start ARP server..."
 cat > /tmp/server_test_xtcp.toml << EOF_CFG
 bind_addr = "0.0.0.0"
 bind_port = $TEST_CONTROL_PORT
+dashboard_addr = "127.0.0.1"
+dashboard_port = $TEST_DASHBOARD_PORT
 log_level = "info"
 
 [auth]
@@ -154,6 +157,21 @@ if [[ "$ERR_MSG" != *"xtcp error"* ]]; then
   echo "response: $ERR_MSG"
   echo "--- bad visitor log ---"
   tail -n 200 /tmp/arp_client_xtcp_visitor_bad.log || true
+  exit 1
+fi
+
+echo "7. Checking xtcp metrics and recent events..."
+XTCP_EVENTS=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/api/v1/xtcp/events" || true)
+if [[ "$XTCP_EVENTS" != *"visitor_forwarded"* ]] || [[ "$XTCP_EVENTS" != *"sk_mismatch"* ]]; then
+  echo "✗ xtcp events API missing expected stages"
+  echo "$XTCP_EVENTS"
+  exit 1
+fi
+
+XTCP_METRICS=$(curl -s "http://127.0.0.1:$TEST_DASHBOARD_PORT/metrics" || true)
+if [[ "$XTCP_METRICS" != *"arp_xtcp_visitor_requests_total"* ]] || [[ "$XTCP_METRICS" != *"arp_xtcp_sk_mismatch_total"* ]]; then
+  echo "✗ xtcp metrics missing"
+  echo "$XTCP_METRICS"
   exit 1
 fi
 

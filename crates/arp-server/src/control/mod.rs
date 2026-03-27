@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use arp_common::auth::Authenticator;
@@ -11,17 +13,26 @@ use arp_common::protocol::{
 use arp_common::transport::MessageTransport;
 use arp_common::{Error, Result};
 
+use crate::metrics;
 use crate::nathole::NatHoleController;
 use crate::proxy::{ProxyManager, WorkConnRequest};
 use crate::resource::ResourceController;
 
 pub struct Control {
     run_id: String,
+    client_id: String,
     peer_addr: String,
+    privilege_key: String,
+    pool_count: u32,
+    hostname: String,
+    os: String,
+    arch: String,
+    user: String,
     transport: tokio::sync::Mutex<Option<MessageTransport>>,
     proxy_manager: Arc<ProxyManager>,
     resource_controller: Arc<ResourceController>,
     authenticator: Arc<Box<dyn Authenticator>>,
+    control_manager: Arc<ControlManager>,
     work_conn_req_tx: mpsc::Sender<WorkConnRequest>,
     work_conn_req_rx: tokio::sync::Mutex<mpsc::Receiver<WorkConnRequest>>,
     pending_work_conns: tokio::sync::Mutex<Vec<WorkConnRequest>>,
@@ -29,28 +40,47 @@ pub struct Control {
     outbound_tx: mpsc::Sender<Message>,
     outbound_rx: tokio::sync::Mutex<mpsc::Receiver<Message>>,
     nathole: Arc<NatHoleController>,
+    heartbeat_timeout: u64,
+    cancel: CancellationToken,
 }
 
 impl Control {
     pub async fn new(
         run_id: String,
+        client_id: String,
         peer_addr: String,
+        privilege_key: String,
+        pool_count: u32,
+        hostname: String,
+        os: String,
+        arch: String,
+        user: String,
         transport: MessageTransport,
         proxy_manager: Arc<ProxyManager>,
         resource_controller: Arc<ResourceController>,
         authenticator: Arc<Box<dyn Authenticator>>,
+        control_manager: Arc<ControlManager>,
         nathole: Arc<NatHoleController>,
+        heartbeat_timeout: u64,
     ) -> Result<Self> {
         let (work_conn_req_tx, work_conn_req_rx) = mpsc::channel(100);
         let (outbound_tx, outbound_rx) = mpsc::channel(100);
 
         Ok(Self {
             run_id,
+            client_id,
             peer_addr,
+            privilege_key,
+            pool_count,
+            hostname,
+            os,
+            arch,
+            user,
             transport: tokio::sync::Mutex::new(Some(transport)),
             proxy_manager,
             resource_controller,
             authenticator,
+            control_manager,
             work_conn_req_tx,
             work_conn_req_rx: tokio::sync::Mutex::new(work_conn_req_rx),
             pending_work_conns: tokio::sync::Mutex::new(Vec::new()),
@@ -58,7 +88,50 @@ impl Control {
             outbound_tx,
             outbound_rx: tokio::sync::Mutex::new(outbound_rx),
             nathole,
+            heartbeat_timeout,
+            cancel: CancellationToken::new(),
         })
+    }
+
+    /// Forcefully close this control connection (called when a newer connection takes over).
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    pub fn os(&self) -> &str {
+        &self.os
+    }
+
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    pub fn pool_count(&self) -> u32 {
+        self.pool_count
+    }
+
+    pub async fn idle_work_conn_count(&self) -> usize {
+        self.idle_work_conns.lock().await.len()
+    }
+
+    pub async fn pending_work_conn_count(&self) -> usize {
+        self.pending_work_conns.lock().await.len()
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -69,9 +142,27 @@ impl Control {
                 .ok_or_else(|| Error::Transport("Control transport already taken".to_string()))?
         };
 
+        let heartbeat_timeout_dur = Duration::from_secs(self.heartbeat_timeout);
+        let heartbeat_deadline = tokio::time::sleep(heartbeat_timeout_dur);
+        tokio::pin!(heartbeat_deadline);
+
         loop {
             tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    warn!("Control connection for run_id {} cancelled (superseded by new connection)", self.run_id);
+                    return Err(Error::Transport("connection superseded".to_string()));
+                }
+                _ = &mut heartbeat_deadline => {
+                    error!(
+                        "Server heartbeat timeout: no message from client {} for {}s, closing connection",
+                        self.run_id, self.heartbeat_timeout
+                    );
+                    return Err(Error::Timeout("server heartbeat timeout".to_string()));
+                }
                 msg = transport.recv() => {
+                    // Reset heartbeat deadline on any received message
+                    heartbeat_deadline.as_mut().reset(tokio::time::Instant::now() + heartbeat_timeout_dur);
+
                     let msg = match msg? {
                         Some(msg) => msg,
                         None => {
@@ -158,11 +249,13 @@ impl Control {
             "Received work connection request for run_id: {}",
             self.run_id
         );
+        metrics::inc_req_work_conn();
 
         if let Some(idle_conn) = {
             let mut idle = self.idle_work_conns.lock().await;
             idle.pop()
         } {
+            metrics::inc_idle_work_conn_hits();
             work_conn_req
                 .reply_tx
                 .send(idle_conn)
@@ -200,6 +293,44 @@ impl Control {
             msg.proxy_name, msg.proxy_type
         );
 
+        // Only allow takeover when the owner has the same stable client_id.
+        if let Some(owner) = self.control_manager.find_proxy_owner(&msg.proxy_name) {
+            if owner.run_id != self.run_id {
+                if !owner.client_id.is_empty() && owner.client_id == self.client_id {
+                    info!(
+                        "Taking over proxy {} from stale run_id {} for client_id {}",
+                        msg.proxy_name, owner.run_id, owner.client_id
+                    );
+                    if self.proxy_manager.evict_proxy_by_name(&msg.proxy_name).await.is_some() {
+                        self.control_manager.shutdown_run(&owner.run_id);
+                    }
+                } else {
+                    let resp = NewProxyRespMsg {
+                        proxy_name: msg.proxy_name.clone(),
+                        remote_addr: String::new(),
+                        error: format!(
+                            "proxy name {} is already in use by another client",
+                            msg.proxy_name
+                        ),
+                    };
+                    return transport.send(Message::NewProxyResp(resp)).await;
+                }
+            }
+        }
+
+        let auth_result = self
+            .authenticator
+            .authorize_proxy(&self.privilege_key, self.pool_count, &msg);
+        if let Err(e) = auth_result {
+            metrics::inc_auth_failures();
+            let resp = NewProxyRespMsg {
+                proxy_name: msg.proxy_name.clone(),
+                remote_addr: String::new(),
+                error: e.to_string(),
+            };
+            return transport.send(Message::NewProxyResp(resp)).await;
+        }
+
         let result = self
             .proxy_manager
             .register_proxy(
@@ -211,12 +342,16 @@ impl Control {
             .await;
 
         let resp = match result {
-            Ok(remote_addr) => NewProxyRespMsg {
+            Ok(remote_addr) => {
+                metrics::inc_proxy_registrations();
+                NewProxyRespMsg {
                 proxy_name: msg.proxy_name.clone(),
                 remote_addr,
                 error: String::new(),
+            }
             },
             Err(e) => {
+                metrics::inc_proxy_registration_failures();
                 error!("Failed to register proxy {}: {}", msg.proxy_name, e);
                 NewProxyRespMsg {
                     proxy_name: msg.proxy_name.clone(),
@@ -302,8 +437,26 @@ impl Control {
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct ControlRecord {
+    pub run_id: String,
+    pub client_id: String,
+    pub peer_addr: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub user: String,
+    pub pool_count: u32,
+}
+
 pub struct ControlManager {
     controls: DashMap<String, Arc<Control>>,
+}
+
+#[derive(Clone)]
+pub struct ProxyOwner {
+    pub run_id: String,
+    pub client_id: String,
 }
 
 impl ControlManager {
@@ -325,8 +478,93 @@ impl ControlManager {
         self.controls.remove(run_id);
     }
 
+    /// Shutdown and remove a control connection by run_id.
+    /// Used to forcefully close a stale connection whose proxy was evicted.
+    pub fn shutdown_run(&self, run_id: &str) {
+        if let Some((_, control)) = self.controls.remove(run_id) {
+            warn!(
+                "Shutting down stale control connection for run_id: {}",
+                run_id
+            );
+            control.shutdown();
+        }
+    }
+
+    pub fn find_proxy_owner(&self, proxy_name: &str) -> Option<ProxyOwner> {
+        self.controls.iter().find_map(|entry| {
+            let control = entry.value();
+            if control.proxy_manager.list_proxy_keys().iter().any(|key| {
+                key == &format!("{}:{}", control.run_id(), proxy_name)
+            }) {
+                Some(ProxyOwner {
+                    run_id: control.run_id().to_string(),
+                    client_id: control.client_id().to_string(),
+                })
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn count(&self) -> usize {
         self.controls.len()
+    }
+
+    pub fn list_controls(&self) -> Vec<ControlRecord> {
+        let mut items: Vec<ControlRecord> = self
+            .controls
+            .iter()
+            .map(|entry| {
+                let control = entry.value();
+                ControlRecord {
+                    run_id: control.run_id().to_string(),
+                    client_id: control.client_id().to_string(),
+                    peer_addr: control.peer_addr().to_string(),
+                    hostname: control.hostname().to_string(),
+                    os: control.os().to_string(),
+                    arch: control.arch().to_string(),
+                    user: control.user().to_string(),
+                    pool_count: control.pool_count(),
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        items
+    }
+
+    pub fn get_control_record(&self, run_id: &str) -> Option<ControlRecord> {
+        self.controls.get(run_id).map(|entry| {
+            let control = entry.value();
+            ControlRecord {
+                run_id: control.run_id().to_string(),
+                client_id: control.client_id().to_string(),
+                peer_addr: control.peer_addr().to_string(),
+                hostname: control.hostname().to_string(),
+                os: control.os().to_string(),
+                arch: control.arch().to_string(),
+                user: control.user().to_string(),
+                pool_count: control.pool_count(),
+            }
+        })
+    }
+
+    pub async fn get_control_queue_stats(&self, run_id: &str) -> Option<(usize, usize)> {
+        let control = self.controls.get(run_id).map(|entry| entry.clone())?;
+        Some((
+            control.pending_work_conn_count().await,
+            control.idle_work_conn_count().await,
+        ))
+    }
+
+    pub async fn get_queue_stats_snapshot(&self) -> (usize, usize) {
+        let controls: Vec<Arc<Control>> = self.controls.iter().map(|entry| entry.clone()).collect();
+        let mut pending = 0usize;
+        let mut idle = 0usize;
+        for control in controls {
+            pending += control.pending_work_conn_count().await;
+            idle += control.idle_work_conn_count().await;
+        }
+        (pending, idle)
     }
 
     pub async fn send_message(&self, run_id: &str, msg: Message) -> Result<()> {

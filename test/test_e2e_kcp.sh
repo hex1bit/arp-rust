@@ -25,7 +25,7 @@ cargo build >/dev/null
 
 echo "1. Starting local backend receiver..."
 rm -f /tmp/arp_kcp_recv
-nc -l "$TEST_LOCAL_PORT" -w 5 > /tmp/arp_kcp_recv &
+nc -l "$TEST_LOCAL_PORT" -w 20 > /tmp/arp_kcp_recv &
 BACKEND_PID=$!
 sleep 2
 
@@ -66,6 +66,7 @@ token = "test_token_123456"
 [transport]
 protocol = "kcp"
 pool_count = 1
+tcp_mux = false
 
 [[proxies]]
 name = "kcp_tcp"
