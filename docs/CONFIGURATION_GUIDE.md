@@ -48,6 +48,8 @@ Important fields:
 - `dashboard_addr` / `dashboard_port`: optional admin endpoints
 - `allow_ports`: allowed remote port ranges for `tcp` / `udp` style proxies
 - `subdomain_host`: base domain for HTTP/HTTPS subdomain routing
+- `log_file`: optional path prefix for log file output (see section 14)
+- `log_max_days`: how many days of log files to keep (default: `1`)
 
 ## 3. Common client fields
 
@@ -78,6 +80,8 @@ Important fields:
 - `transport.heartbeat_timeout`: local timeout for detecting dead server connections
 - `[[proxies]]`: provider-side proxy definitions
 - `[[visitors]]`: visitor-side config for `xtcp`
+- `log_file`: optional path prefix for log file output (see section 14)
+- `log_max_days`: how many days of log files to keep (default: `1`)
 
 ### Why `client_id` matters
 
@@ -818,3 +822,95 @@ Client side:
 - `examples/client_http_custom_domain.toml`
 - `examples/client_http_subdomain.toml`
 - `examples/client_https_custom_domain.toml`
+
+## 14. Log file output and rotation
+
+By default both `arps` and `arpc` write logs to **stdout**.
+
+To redirect logs to a file with automatic daily rotation, add these fields to your config:
+
+```toml
+# Path prefix for the log file.
+# The actual file is named <prefix>.<YYYY-MM-DD>, rotated daily.
+# The directory is created automatically if it does not exist.
+log_file = "/var/log/arp/arps"
+
+# Number of days of log files to keep.
+# Files older than this are deleted at startup.
+# Default: 1  (keep only today's file)
+# Set to 0 to disable automatic purging.
+log_max_days = 7
+```
+
+When `log_file` is set:
+
+- Logs go **only** to the file; stdout is silent.
+- Files are named `<prefix>.<YYYY-MM-DD>`, e.g. `arps.2026-04-20`.
+- A new file is opened automatically at midnight.
+- ANSI colour codes are stripped from file output.
+
+Example server config with file logging:
+
+```toml
+bind_addr = "0.0.0.0"
+bind_port = 17000
+log_level = "info"
+log_file = "/var/log/arp/arps"
+log_max_days = 7
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "websocket"
+tcp_mux = true
+
+[transport.tls]
+enable = true
+cert_file = "/etc/arp/server.crt"
+key_file  = "/etc/arp/server.key"
+
+[[allow_ports]]
+start = 6001
+end = 7000
+```
+
+Example client config with file logging:
+
+```toml
+server_addr = "your.server.name"
+server_port = 443
+client_id   = "prod-node-1"
+log_level   = "info"
+log_file    = "/var/log/arp/arpc"
+log_max_days = 7
+
+[auth]
+method = "token"
+token  = "replace_with_token"
+
+[transport]
+protocol   = "websocket"
+tcp_mux    = true
+pool_count = 1
+
+[transport.tls]
+enable          = true
+trusted_ca_file = "/etc/arp/server.crt"
+server_name     = "your.server.name"
+
+[[proxies]]
+name       = "ssh"
+type       = "tcp"
+local_ip   = "127.0.0.1"
+local_port = 22
+remote_port = 6001
+```
+
+Notes:
+
+- `log_file` takes a path **prefix**, not a full filename. Do not append `.log` — the date suffix is added automatically.
+- If the specified directory does not exist it is created at startup; if creation fails, the process falls back to stdout.
+- `log_max_days = 1` (default) keeps only today's file, suitable for disk-constrained servers.
+- `log_max_days = 0` disables purging entirely.

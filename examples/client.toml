@@ -2,6 +2,10 @@ server_addr = "127.0.0.1"
 server_port = 17000
 
 log_level = "info"
+# Optional: write logs to file with daily rotation.
+# If not set, logs go to stdout.
+# log_file = "/var/log/arp/arpc"
+# log_max_days = 1
 
 [auth]
 method = "token"

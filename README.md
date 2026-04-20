@@ -67,6 +67,7 @@ Before deploying ARP-Rust to the public internet, verify the following:
 - WebSocket transport (`ws` / `wss`)
 - Admin endpoints for health, metrics, and proxy status
 - TOML-based configuration
+- File-based log output with daily rotation and auto-purge (`log_file`, `log_max_days`)
 
 ## Workspace Layout
 

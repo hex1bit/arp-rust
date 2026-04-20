@@ -2,6 +2,8 @@ server_addr = "your.server.name"
 server_port = 443
 
 log_level = "info"
+# log_file = "/var/log/arp/arpc"
+# log_max_days = 1
 
 [auth]
 method = "token"
