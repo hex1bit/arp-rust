@@ -41,6 +41,12 @@ pub struct ServerConfig {
     pub log_level: String,
 
     #[serde(default)]
+    pub log_file: String,
+
+    #[serde(default = "default_log_max_days")]
+    pub log_max_days: u32,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -78,6 +84,12 @@ pub struct ClientConfig {
 
     #[serde(default)]
     pub log_level: String,
+
+    #[serde(default)]
+    pub log_file: String,
+
+    #[serde(default = "default_log_max_days")]
+    pub log_max_days: u32,
 
     #[serde(default)]
     pub auth: AuthConfig,
@@ -582,6 +594,10 @@ fn default_xtcp_punch_timeout_secs() -> u64 {
     12
 }
 
+fn default_log_max_days() -> u32 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,6 +688,8 @@ mod tests {
             server_port: 7000,
             client_id: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
                 protocol: "websocket".to_string(),
@@ -698,6 +716,8 @@ mod tests {
             server_port: 7000,
             client_id: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
                 protocol: "websocket".to_string(),
@@ -732,6 +752,8 @@ mod tests {
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
                 protocol: "websocket".to_string(),
