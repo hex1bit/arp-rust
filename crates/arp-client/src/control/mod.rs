@@ -163,12 +163,7 @@ impl Control {
         let has_lb_group = !proxy_config.load_balancer.group.trim().is_empty();
         let multiplexer = if proxy_config.multiplexer.is_empty()
             && self.config.transport.tcp_mux
-            && matches!(
-                proxy_config.proxy_type,
-                arp_common::config::ProxyType::Tcp
-                    | arp_common::config::ProxyType::Http
-                    | arp_common::config::ProxyType::Https
-            )
+            && proxy_config.proxy_type == arp_common::config::ProxyType::Tcp
             && !has_lb_group
         {
             "tcp_mux".to_string()
@@ -412,12 +407,7 @@ impl Control {
             let has_lb_group = !proxy_config.load_balancer.group.trim().is_empty();
             let multiplexer = if proxy_config.multiplexer.is_empty()
                 && self.config.transport.tcp_mux
-                && matches!(
-                    proxy_config.proxy_type,
-                    arp_common::config::ProxyType::Tcp
-                        | arp_common::config::ProxyType::Http
-                        | arp_common::config::ProxyType::Https
-                )
+                && proxy_config.proxy_type == arp_common::config::ProxyType::Tcp
                 && !has_lb_group
             {
                 "tcp_mux".to_string()
