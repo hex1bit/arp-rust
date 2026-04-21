@@ -284,6 +284,8 @@ Practical guidance:
 
 For a scenario-based configuration guide, see `docs/CONFIGURATION_GUIDE.md`.
 
+For version history and release notes, see `CHANGELOG.md`.
+
 General examples:
 
 - `examples/server.toml`

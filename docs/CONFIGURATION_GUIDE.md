@@ -914,3 +914,187 @@ Notes:
 - If the specified directory does not exist it is created at startup; if creation fails, the process falls back to stdout.
 - `log_max_days = 1` (default) keeps only today's file, suitable for disk-constrained servers.
 - `log_max_days = 0` disables purging entirely.
+
+## 15. Client admin API and dynamic proxy management
+
+The client can expose a local HTTP API for runtime proxy management and diagnostics.
+
+```toml
+# Client config
+admin_addr = "127.0.0.1"
+admin_port = 7400
+admin_user = "admin"      # optional Basic Auth
+admin_pwd = "secret"       # optional Basic Auth
+```
+
+When `admin_port > 0`, the following endpoints are available:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/status` | Connection status, server info, proxy list |
+| GET | `/api/v1/proxies` | List all registered proxies |
+| GET | `/api/v1/proxies/:name` | Proxy detail and availability |
+| POST | `/api/v1/proxies` | Add a proxy at runtime (JSON body) |
+| DELETE | `/api/v1/proxies/:name` | Remove a proxy at runtime |
+| POST | `/api/v1/reload` | Reload config file, diff and apply changes |
+
+### Adding a proxy at runtime
+
+```bash
+curl -u admin:secret -X POST http://127.0.0.1:7400/api/v1/proxies \
+  -H "Content-Type: application/json" \
+  -d '{"name":"new-svc","type":"tcp","local_ip":"127.0.0.1","local_port":3000,"remote_port":6002}'
+# Response: {"ok":true,"message":"proxy registered","remote_addr":"0.0.0.0:6002"}
+```
+
+### Removing a proxy at runtime
+
+```bash
+curl -u admin:secret -X DELETE http://127.0.0.1:7400/api/v1/proxies/new-svc
+# Response: {"ok":true,"message":"proxy new-svc closed"}
+```
+
+### Reloading config from file
+
+```bash
+curl -u admin:secret -X POST http://127.0.0.1:7400/api/v1/reload
+# Response: {"ok":true,"message":"reload complete: 1 added, 0 removed"}
+```
+
+## 16. CLI diagnostic commands
+
+The `arpc` binary supports subcommands for diagnostics. These require `admin_port` to be configured.
+
+```bash
+# Run the client (default, same as before)
+arpc -c client.toml
+arpc run -c client.toml
+
+# Show connection status and proxy list
+arpc status -c client.toml
+
+# Diagnose a specific proxy (checks control connection, proxy registration, local service)
+arpc check ssh -c client.toml
+
+# Diagnose all proxies
+arpc check -c client.toml
+```
+
+## 17. Config hot-reload via SIGHUP
+
+On Unix systems, the client reloads its config file when it receives a `SIGHUP` signal:
+
+```bash
+kill -HUP $(pidof arpc)
+```
+
+This compares the running proxies with the new config and:
+- adds proxies that are new in the config
+- removes proxies that are no longer in the config
+- leaves unchanged proxies untouched (active connections are not interrupted)
+
+## 18. HMAC authentication
+
+Since v0.4.0, tokens are never sent in plaintext over the network.
+
+- The client computes `HMAC-SHA256(token, timestamp)` and sends the signature as `privilege_key`
+- The server verifies the signature against all known tokens
+- A 5-minute anti-replay window is enforced: messages with timestamps more than 300 seconds from the server's clock are rejected
+
+No configuration change is needed — this is automatic when both client and server are v0.4.0+.
+
+**Important:** Client and server must both be v0.4.0+ for HMAC auth to work. A v0.4.0 client cannot authenticate with a pre-v0.4.0 server (and vice versa).
+
+## 19. Audit logging
+
+The server emits structured JSON audit events for all security-relevant operations:
+
+```
+{"event":"client_login","client_id":"user@host","peer_addr":"1.2.3.4:5678","run_id":"..."}
+{"event":"proxy_registered","client_id":"user@host","run_id":"...","proxy_name":"web","proxy_type":"tcp","remote_addr":"0.0.0.0:6001"}
+{"event":"proxy_closed","run_id":"...","proxy_name":"web"}
+{"event":"client_disconnect","client_id":"user@host","run_id":"..."}
+```
+
+Events appear in the standard log output (via `tracing`). To separate them, filter by target `audit` in your log pipeline.
+
+## 20. Graceful shutdown
+
+Both server and client handle `Ctrl+C` / `SIGTERM` gracefully:
+
+- **Server:** stops accepting new connections, waits up to 30 seconds for active connections to complete, then exits
+- **Client:** cleanly disconnects from server and exits
+
+## 21. Per-proxy metrics
+
+The server tracks per-proxy metrics that appear in the `/metrics` endpoint:
+
+```
+arp_proxy_bytes_in{proxy="web"} 12345
+arp_proxy_bytes_out{proxy="web"} 67890
+arp_proxy_connections_total{proxy="web"} 42
+arp_proxy_connections_active{proxy="web"} 3
+arp_proxy_errors{proxy="web"} 0
+```
+
+These are available in addition to the global metrics (`arp_tcp_bytes_in_total`, etc.).
+
+## 22. SSE real-time event stream
+
+The server dashboard provides a Server-Sent Events endpoint for real-time monitoring:
+
+```bash
+curl -N http://server:17500/api/v1/events/stream
+```
+
+Events are delivered as JSON:
+
+```
+data: {"event":"client_login","client_id":"user@host","peer_addr":"...","run_id":"..."}
+
+data: {"event":"proxy_registered","client_id":"user@host","run_id":"...","proxy_name":"web","proxy_type":"tcp","remote_addr":"0.0.0.0:6001"}
+```
+
+A keepalive comment is sent periodically to prevent connection timeout.
+
+## 23. Multi-tenant runtime limits
+
+Per-token rules can enforce runtime limits beyond the registration-time checks:
+
+```toml
+[[auth.rules]]
+token = "team-frontend"
+allow_proxy_types = ["http", "https"]
+allow_subdomain_prefixes = ["fe-"]
+max_pool_count = 5
+max_connections = 100          # max concurrent connections for this token
+bandwidth_limit_bytes = 10485760  # 10 MB/s bandwidth cap
+```
+
+- `max_connections = 0` (default) means unlimited
+- `bandwidth_limit_bytes = 0` (default) means unlimited
+
+## 24. Server dashboard
+
+When `dashboard_addr` and `dashboard_port` are configured, the server provides:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | HTML dashboard with live stats |
+| `GET /healthz` | Health check (returns `ok`) |
+| `GET /readyz` | Readiness check (JSON with active controls/proxies) |
+| `GET /metrics` | Prometheus-format metrics (global + per-proxy) |
+| `GET /api/v1/status` | Server status JSON |
+| `GET /api/v1/proxies` | List all registered proxies |
+| `GET /api/v1/proxies/:name` | Proxy detail |
+| `GET /api/v1/clients` | List connected clients |
+| `GET /api/v1/clients/:run_id` | Client detail with queue stats |
+| `POST /api/v1/clients/:run_id/shutdown` | Force disconnect a client |
+| `GET /api/v1/xtcp/events` | Recent XTCP NAT traversal events |
+| `GET /api/v1/events/stream` | SSE real-time event stream |
+
+```toml
+# Server config
+dashboard_addr = "0.0.0.0"
+dashboard_port = 17500
+```
