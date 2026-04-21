@@ -7,6 +7,13 @@ log_level = "info"
 # log_file = "/var/log/arp/arpc"
 # log_max_days = 1
 
+# Client admin API (optional) — enables dynamic proxy management and diagnostics.
+# When configured, you can use `arpc status` / `arpc check` and the REST API.
+admin_addr = "127.0.0.1"
+admin_port = 7400
+# admin_user = "admin"
+# admin_pwd = "secret"
+
 [auth]
 method = "token"
 token = "replace_with_token"

@@ -1,11 +1,12 @@
 use std::sync::Arc;
-use std::{net::ToSocketAddrs, time::Duration};
+use std::time::Duration;
 
 use quinn::{Endpoint, ServerConfig as QuicServerConfig, TransportConfig as QuicTransportConfig};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_kcp::{KcpConfig, KcpListener, KcpNoDelayConfig};
+use tokio_kcp::KcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ pub struct Service {
     authenticator: Arc<Box<dyn Authenticator>>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     nathole: Arc<NatHoleController>,
+    cancel: CancellationToken,
 }
 
 impl Service {
@@ -64,6 +66,7 @@ impl Service {
             authenticator: Arc::new(authenticator),
             tls_acceptor,
             nathole,
+            cancel: CancellationToken::new(),
         })
     }
 
@@ -82,7 +85,7 @@ impl Service {
                     proxy_manager: self.proxy_manager.clone(),
                     nathole: self.nathole.clone(),
                     started_at_unix: chrono::Utc::now().timestamp(),
-                    transport_protocol: self.config.transport.protocol.clone(),
+                    transport_protocol: self.config.transport.protocol.to_string(),
                     bind_addr: self.config.bind_addr.clone(),
                     bind_port: self.config.bind_port,
                     dashboard_enabled: true,
@@ -92,10 +95,34 @@ impl Service {
             );
         }
 
-        match self.config.transport.protocol.as_str() {
-            "kcp" => self.run_kcp().await,
-            "quic" => self.run_quic().await,
+        use arp_common::config::TransportProtocol;
+        match self.config.transport.protocol {
+            TransportProtocol::Kcp => self.run_kcp().await,
+            TransportProtocol::Quic => self.run_quic().await,
             _ => self.run_tcp_like().await,
+        }
+    }
+
+    pub async fn graceful_shutdown(&self) {
+        info!("Initiating graceful shutdown...");
+        self.cancel.cancel();
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(deadline);
+        loop {
+            let count = self.control_manager.count();
+            if count == 0 {
+                info!("All connections drained");
+                break;
+            }
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!("Drain timeout, {} connections still active", count);
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    debug!("Waiting for {} connections to drain...", count);
+                }
+            }
         }
     }
 
@@ -109,8 +136,14 @@ impl Service {
         );
 
         loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
+            tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    info!("TCP listener shutting down");
+                    return Ok(());
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
                     metrics::inc_incoming_connections();
                     debug!("New connection from {}", peer_addr);
                     let service = self.clone();
@@ -124,6 +157,8 @@ impl Service {
                     error!("Failed to accept connection: {}", e);
                 }
             }
+                }
+            }
         }
     }
 
@@ -134,7 +169,7 @@ impl Service {
             self.config.bind_port
         };
         let bind_addr = format!("{}:{}", self.config.bind_addr, bind_port);
-        let mut listener = KcpListener::bind(build_kcp_config(), &bind_addr)
+        let mut listener = KcpListener::bind(arp_common::transport::build_kcp_config(), &bind_addr)
             .await
             .map_err(|e| Error::Transport(format!("KCP bind failed on {}: {}", bind_addr, e)))?;
 
@@ -170,7 +205,7 @@ impl Service {
         } else {
             self.config.bind_port
         };
-        let bind_addr = resolve_socket_addr(&self.config.bind_addr, bind_port)?;
+        let bind_addr = arp_common::transport::resolve_socket_addr(&self.config.bind_addr, bind_port)?;
         let endpoint = Endpoint::server(build_quic_server_config(&self.config)?, bind_addr)
             .map_err(Error::Io)?;
 
@@ -217,7 +252,7 @@ impl Service {
 
     async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         let peer_addr = stream.peer_addr().map_err(|e| Error::Io(e))?;
-        let transport = if self.config.transport.protocol == "websocket" {
+        let transport = if self.config.transport.protocol == arp_common::config::TransportProtocol::Websocket {
             if let Some(acceptor) = &self.tls_acceptor {
                 let tls_stream = acceptor
                     .accept(stream)
@@ -289,18 +324,25 @@ impl Service {
             peer_addr, login_msg.version, login_msg.hostname, login_msg.os, login_msg.arch
         );
 
-        if let Err(e) = self.authenticator.verify_login(&login_msg) {
-            metrics::inc_auth_failures();
-            error!("Authentication failed for {}: {}", peer_addr, e);
-            transport
-                .send(Message::LoginResp(LoginRespMsg {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    run_id: String::new(),
-                    error: e.to_string(),
-                }))
-                .await?;
-            return Err(e);
-        }
+        let matched_token = match self.authenticator.verify_login(&login_msg) {
+            Ok(token) => token,
+            Err(e) => {
+                metrics::inc_auth_failures();
+                error!("Authentication failed for {}: {}", peer_addr, e);
+                crate::audit::emit(crate::audit::AuditEvent::ClientLoginFailed {
+                    peer_addr: peer_addr.clone(),
+                    reason: e.to_string(),
+                });
+                transport
+                    .send(Message::LoginResp(LoginRespMsg {
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        run_id: String::new(),
+                        error: e.to_string(),
+                    }))
+                    .await?;
+                return Err(e);
+            }
+        };
 
         let run_id = Uuid::new_v4().to_string();
         info!("Generated run_id: {} for {}", run_id, peer_addr);
@@ -313,6 +355,12 @@ impl Service {
             }))
             .await?;
 
+        crate::audit::emit(crate::audit::AuditEvent::ClientLogin {
+            client_id: login_msg.client_id.clone(),
+            peer_addr: peer_addr.clone(),
+            run_id: run_id.clone(),
+        });
+
         let heartbeat_timeout = if self.config.transport.heartbeat_timeout > 0 {
             self.config.transport.heartbeat_timeout
         } else {
@@ -324,7 +372,7 @@ impl Service {
                 run_id.clone(),
                 login_msg.client_id.clone(),
                 peer_addr.clone(),
-                login_msg.privilege_key.clone(),
+                matched_token,
                 login_msg.pool_count,
                 login_msg.hostname.clone(),
                 login_msg.os.clone(),
@@ -351,6 +399,11 @@ impl Service {
         self.control_manager.remove(&run_id);
         info!("Control connection closed for run_id: {}", run_id);
 
+        crate::audit::emit(crate::audit::AuditEvent::ClientDisconnect {
+            client_id: login_msg.client_id.clone(),
+            run_id: run_id.clone(),
+        });
+
         result
     }
 
@@ -371,6 +424,10 @@ impl Service {
                 "Work connection authentication failed for run_id {}: {}",
                 work_conn_msg.run_id, e
             );
+            crate::audit::emit(crate::audit::AuditEvent::WorkConnAuthFailed {
+                run_id: work_conn_msg.run_id.clone(),
+                reason: e.to_string(),
+            });
             return Err(e);
         }
 
@@ -415,16 +472,6 @@ fn build_tls_acceptor(config: &ServerConfig) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-fn build_kcp_config() -> KcpConfig {
-    let mut config = KcpConfig::default();
-    config.stream = true;
-    config.nodelay = KcpNoDelayConfig::fastest();
-    config.flush_write = true;
-    config.flush_acks_input = true;
-    config.session_expire = Duration::from_secs(120);
-    config
-}
-
 fn build_quic_server_config(config: &ServerConfig) -> Result<QuicServerConfig> {
     if config.transport.tls.cert_file.is_empty() || config.transport.tls.key_file.is_empty() {
         return Err(Error::Config(
@@ -456,12 +503,4 @@ fn build_quic_server_config(config: &ServerConfig) -> Result<QuicServerConfig> {
     ));
     server_config.transport = Arc::new(transport);
     Ok(server_config)
-}
-
-fn resolve_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| Error::Config(format!("Failed to resolve {}:{}: {}", host, port, e)))?
-        .next()
-        .ok_or_else(|| Error::Config(format!("No socket address resolved for {}:{}", host, port)))
 }

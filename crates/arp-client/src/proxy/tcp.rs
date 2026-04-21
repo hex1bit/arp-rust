@@ -4,15 +4,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, warn};
 
 use arp_common::config::ProxyConfig;
-use arp_common::crypto::PacketCipher;
 use arp_common::transport::mux::{read_mux_frame, write_mux_frame, MuxFrame};
 use arp_common::transport::prefixed::PrefixedStream;
+use arp_common::transport::relay::relay_stcp;
 use arp_common::transport::{copy_bidirectional, MessageTransport};
 use arp_common::{Error, Result};
 
@@ -36,7 +36,7 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     pub fn new(config: ProxyConfig) -> Self {
-        let stcp = config.proxy_type == "stcp";
+        let stcp = config.proxy_type == arp_common::config::ProxyType::Stcp;
         let tcp_mux = matches!(
             config.multiplexer.as_str(),
             "tcp_mux" | "mux" | "smux" | "yamux"
@@ -69,7 +69,7 @@ impl TcpProxy {
 
         let (mut reader, mut writer) = tokio::io::split(io);
         let (frame_tx, mut frame_rx) = mpsc::channel::<MuxFrame>(1024);
-        let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+        let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<bytes::Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let writer_task = tokio::spawn(async move {
@@ -92,7 +92,7 @@ impl TcpProxy {
 
             match frame {
                 MuxFrame::Open { stream_id } => {
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+                    let (tx, rx) = mpsc::channel::<bytes::Bytes>(256);
                     streams.lock().await.insert(stream_id, tx);
                     let frame_tx_clone = frame_tx.clone();
                     let streams_clone = Arc::clone(&streams);
@@ -270,16 +270,17 @@ impl TcpProxy {
             Box::new(PrefixedStream::new(pre_read_data, work_stream))
         };
 
-        relay_stcp(local_stream, work_stream, &self.secret).await
+        relay_stcp(local_stream, work_stream, &self.secret).await?;
+        Ok(())
     }
 }
 
 async fn handle_local_stream(
     stream_id: u32,
     local_addr: String,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<bytes::Bytes>,
     frame_tx: mpsc::Sender<MuxFrame>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<bytes::Bytes>>>>,
 ) -> Result<()> {
     let local_stream = TcpStream::connect(&local_addr).await.map_err(|e| {
         Error::Proxy(format!(
@@ -306,7 +307,7 @@ async fn handle_local_stream(
         frame_tx
             .send(MuxFrame::Data {
                 stream_id,
-                payload: buf[..n].to_vec(),
+                payload: bytes::Bytes::copy_from_slice(&buf[..n]),
             })
             .await
             .map_err(|_| Error::Transport("tcp_mux frame channel closed".to_string()))?;
@@ -316,80 +317,4 @@ async fn handle_local_stream(
     streams.lock().await.remove(&stream_id);
     writer_task.abort();
     Ok(())
-}
-
-async fn relay_stcp(
-    local_stream: TcpStream,
-    work_stream: arp_common::transport::BoxedStream,
-    secret: &str,
-) -> Result<()> {
-    let (mut local_r, mut local_w) = tokio::io::split(local_stream);
-    let (mut work_r, mut work_w) = tokio::io::split(work_stream);
-    let secret_a = secret.to_string();
-    let secret_b = secret.to_string();
-
-    let a = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = local_r.read(&mut buf).await.map_err(Error::Io)?;
-            if n == 0 {
-                work_w.shutdown().await.map_err(Error::Io)?;
-                return Ok::<(), Error>(());
-            }
-            let encrypted = PacketCipher::encrypt(&buf[..n], &secret_a)?;
-            write_frame(&mut work_w, &encrypted).await?;
-        }
-    });
-
-    let b = tokio::spawn(async move {
-        loop {
-            let Some(frame) = read_frame_optional(&mut work_r).await? else {
-                local_w.shutdown().await.map_err(Error::Io)?;
-                return Ok::<(), Error>(());
-            };
-            let plain = PacketCipher::decrypt(&frame, &secret_b)?;
-            local_w.write_all(&plain).await.map_err(Error::Io)?;
-        }
-    });
-
-    let (ra, rb) = tokio::join!(a, b);
-    match (ra, rb) {
-        (Ok(Ok(())), Ok(Ok(()))) => Ok(()),
-        (Ok(Err(e)), _) => Err(e),
-        (_, Ok(Err(e))) => Err(e),
-        (Err(e), _) => Err(Error::Transport(format!("stcp task join failed: {}", e))),
-        (_, Err(e)) => Err(Error::Transport(format!("stcp task join failed: {}", e))),
-    }
-}
-
-async fn write_frame<W>(writer: &mut W, data: &[u8]) -> Result<()>
-where
-    W: AsyncWrite + Unpin + ?Sized,
-{
-    writer
-        .write_u32(data.len() as u32)
-        .await
-        .map_err(Error::Io)?;
-    writer.write_all(data).await.map_err(Error::Io)?;
-    writer.flush().await.map_err(Error::Io)?;
-    Ok(())
-}
-
-async fn read_frame_optional<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(Error::Io(e)),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 1024 * 1024 {
-        return Err(Error::Protocol("stcp frame too large".to_string()));
-    }
-    let mut data = vec![0u8; len];
-    reader.read_exact(&mut data).await.map_err(Error::Io)?;
-    Ok(Some(data))
 }

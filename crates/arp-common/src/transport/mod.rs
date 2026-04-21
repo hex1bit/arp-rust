@@ -1,12 +1,18 @@
 pub mod mux;
 pub mod prefixed;
 pub mod quic_stream;
+pub mod relay;
+pub mod throttle;
 pub mod udp_mux;
 pub mod ws_stream;
+
+use std::net::ToSocketAddrs;
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio_kcp::{KcpConfig, KcpNoDelayConfig};
 use tokio_util::codec::Framed;
 use tracing::{debug, error};
 
@@ -74,6 +80,24 @@ where
         .map_err(|e| Error::Transport(format!("Bidirectional copy failed: {}", e)))
 }
 
+pub fn build_kcp_config() -> KcpConfig {
+    let mut config = KcpConfig::default();
+    config.stream = true;
+    config.nodelay = KcpNoDelayConfig::fastest();
+    config.flush_write = true;
+    config.flush_acks_input = true;
+    config.session_expire = Duration::from_secs(120);
+    config
+}
+
+pub fn resolve_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::Config(format!("Failed to resolve {}:{}: {}", host, port, e)))?
+        .next()
+        .ok_or_else(|| Error::Config(format!("No socket address resolved for {}:{}", host, port)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +147,49 @@ mod tests {
         }
 
         server_handle.await.unwrap();
+    }
+
+    /// When the remote side closes the connection, recv() must return Ok(None).
+    /// The caller (client message loop) must treat this as a retriable error
+    /// (ConnectionClosed) so the reconnection logic kicks in.
+    #[tokio::test]
+    async fn test_recv_returns_none_on_server_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept then immediately drop (simulates server shutdown / crash)
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream); // close connection immediately
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let mut transport = MessageTransport::new(client_stream);
+
+        // recv() should return Ok(None) — not an Err
+        let result = transport.recv().await;
+        assert!(result.is_ok(), "recv on closed conn should be Ok, got {:?}", result);
+        assert!(result.unwrap().is_none(), "recv on closed conn should be None");
+
+        // ConnectionClosed must be retriable
+        assert!(crate::Error::ConnectionClosed.is_retriable());
+
+        server_handle.await.unwrap();
+    }
+
+    /// Verify that all retriable error variants are correctly classified,
+    /// and that permanent errors are not.
+    #[test]
+    fn test_connection_closed_is_retriable() {
+        use crate::Error;
+        // Retriable
+        assert!(Error::ConnectionClosed.is_retriable());
+        assert!(Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "")).is_retriable());
+        assert!(Error::Transport("test".to_string()).is_retriable());
+        assert!(Error::Timeout("test".to_string()).is_retriable());
+        // Not retriable
+        assert!(!Error::Auth("bad token".to_string()).is_retriable());
+        assert!(!Error::Config("bad config".to_string()).is_retriable());
+        assert!(!Error::Proxy("rejected".to_string()).is_retriable());
     }
 }

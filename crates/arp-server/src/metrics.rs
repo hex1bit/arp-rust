@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 pub struct Metrics {
@@ -142,4 +144,46 @@ pub fn inc_xtcp_responses_forwarded() {
     METRICS
         .xtcp_responses_forwarded_total
         .fetch_add(1, Ordering::Relaxed);
+}
+
+// ── Per-proxy metrics ─────────────────────────────────────────────────
+
+pub struct ProxyMetrics {
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub connections_total: AtomicU64,
+    pub connections_active: AtomicI64,
+    pub errors: AtomicU64,
+}
+
+impl ProxyMetrics {
+    pub fn new() -> Self {
+        Self {
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            connections_total: AtomicU64::new(0),
+            connections_active: AtomicI64::new(0),
+            errors: AtomicU64::new(0),
+        }
+    }
+}
+
+static PROXY_METRICS: Lazy<DashMap<String, Arc<ProxyMetrics>>> = Lazy::new(DashMap::new);
+
+pub fn get_or_create_proxy_metrics(proxy_name: &str) -> Arc<ProxyMetrics> {
+    PROXY_METRICS
+        .entry(proxy_name.to_string())
+        .or_insert_with(|| Arc::new(ProxyMetrics::new()))
+        .clone()
+}
+
+pub fn remove_proxy_metrics(proxy_name: &str) {
+    PROXY_METRICS.remove(proxy_name);
+}
+
+pub fn list_proxy_metrics() -> Vec<(String, Arc<ProxyMetrics>)> {
+    PROXY_METRICS
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect()
 }

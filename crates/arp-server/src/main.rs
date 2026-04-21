@@ -1,3 +1,4 @@
+mod audit;
 mod control;
 mod metrics;
 mod nathole;
@@ -52,7 +53,15 @@ async fn main() -> Result<()> {
     info!("Bind address: {}:{}", config.bind_addr, config.bind_port);
 
     let service = service::Service::new(config).await?;
-    service.run().await?;
+    let service_for_shutdown = service.clone();
+
+    tokio::select! {
+        res = service.run() => { res? }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal, draining connections...");
+            service_for_shutdown.graceful_shutdown().await;
+        }
+    }
 
     Ok(())
 }

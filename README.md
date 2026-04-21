@@ -21,13 +21,17 @@ For first-time production deployment, `wss` is the recommended default because i
 
 ## Why ARP-Rust
 
-ARP-Rust is aimed at users who want a self-hosted tunneling tool with:
+ARP-Rust is designed for teams and production environments, not just personal use:
 
-- a compact Rust implementation
-- multiple transport backends instead of a single fixed tunnel type
-- support for both raw TCP/UDP forwarding and HTTP/HTTPS virtual-host routing
-- optional secure and NAT-traversal-oriented proxy modes such as `stcp`, `sudp`, and `xtcp`
-- a practical path from simple local testing to public-internet deployment
+- **dynamic proxy management** — add/remove proxies at runtime via REST API or `SIGHUP`, no restart needed
+- **built-in diagnostics** — `arpc status` / `arpc check` for instant troubleshooting
+- **security-first** — HMAC-signed authentication, structured audit logs, anti-replay protection
+- **production-ready ops** — graceful shutdown with connection draining, config hot-reload
+- **multi-tenant isolation** — per-token connection limits, bandwidth caps, port/domain restrictions
+- **real-time observability** — per-proxy metrics, Prometheus endpoint, SSE event stream
+- **multiple transport backends** — TCP, TLS, KCP, QUIC, WebSocket, WSS
+- **mux-first architecture** — TCP multiplexing by default, reducing connection overhead
+- a compact Rust implementation with zero unsafe code
 
 ## Use Cases
 
@@ -50,6 +54,9 @@ Before deploying ARP-Rust to the public internet, verify the following:
 - keep `transport.tls.server_name` aligned with the certificate hostname
 - open only the control port and the required `allow_ports` range in the firewall
 - start with a single `tcp` proxy first, then expand to more transports or proxy types
+- enable the server dashboard (`dashboard_port`) for monitoring and the `/metrics` endpoint
+- configure `admin_port` on the client for dynamic management and diagnostics
+- use `auth.rules` with `max_connections` and `bandwidth_limit_bytes` for multi-tenant deployments
 
 ## Features
 
@@ -65,6 +72,17 @@ Before deploying ARP-Rust to the public internet, verify the following:
 - KCP transport
 - QUIC transport
 - WebSocket transport (`ws` / `wss`)
+- **Dynamic proxy management** — add, remove, and reload proxies at runtime via REST API or SIGHUP
+- **Diagnostic CLI** — `arpc status` and `arpc check` for connection and proxy health inspection
+- **HMAC-SHA256 authentication** — tokens are never sent in plaintext; signed with timestamp and verified with anti-replay window
+- **Structured audit logging** — JSON audit events for login, disconnect, proxy registration/rejection
+- **Graceful shutdown** — drains active connections before exit (30s timeout)
+- **Config hot-reload** — `kill -HUP` reloads client config, adding/removing proxies without restart
+- **Per-proxy metrics** — bytes in/out, active/total connections, errors per proxy in `/metrics`
+- **SSE event stream** — `GET /api/v1/events/stream` for real-time server event monitoring
+- **Multi-tenant runtime limits** — per-token `max_connections` and `bandwidth_limit_bytes`
+- **Session-cached AES encryption** — avoids per-packet key derivation in STCP/SUDP
+- **Mux-first architecture** — TCP multiplexing enabled by default for TCP, HTTP, and HTTPS proxies
 - Admin endpoints for health, metrics, and proxy status
 - TOML-based configuration
 - File-based log output with daily rotation and auto-purge (`log_file`, `log_max_days`)
@@ -119,6 +137,10 @@ Server example:
 bind_addr = "0.0.0.0"
 bind_port = 17000
 
+# Dashboard and monitoring
+dashboard_addr = "0.0.0.0"
+dashboard_port = 17500
+
 [auth]
 method = "token"
 token = "replace_with_token"
@@ -137,6 +159,10 @@ Client example:
 ```toml
 server_addr = "server.example.com"
 server_port = 17000
+
+# Enable client admin API for dynamic proxy management
+admin_addr = "127.0.0.1"
+admin_port = 7400
 
 [auth]
 method = "token"
@@ -160,6 +186,13 @@ Run:
 ```bash
 ./target/release/arps -c server.toml
 ./target/release/arpc -c client.toml
+```
+
+Check status from another terminal:
+
+```bash
+arpc status -c client.toml
+arpc check ssh -c client.toml
 ```
 
 Then connect through the public side:
@@ -362,12 +395,92 @@ Individual tests are also available under `test/` if you want to run a specific 
 
 ## Admin Endpoints
 
+### Server Dashboard
+
 When `dashboard_addr` and `dashboard_port` are configured on the server:
 
-- `GET /healthz`
-- `GET /metrics`
-- `GET /api/v1/status`
-- `GET /api/v1/proxies`
+- `GET /` — HTML dashboard
+- `GET /healthz` — health check
+- `GET /readyz` — readiness check
+- `GET /metrics` — Prometheus-format metrics (global + per-proxy)
+- `GET /api/v1/status` — server status JSON
+- `GET /api/v1/proxies` — list registered proxies
+- `GET /api/v1/proxies/:name` — proxy detail
+- `GET /api/v1/clients` — list connected clients
+- `GET /api/v1/clients/:run_id` — client detail
+- `POST /api/v1/clients/:run_id/shutdown` — force disconnect a client
+- `GET /api/v1/xtcp/events` — recent XTCP NAT traversal events
+- `GET /api/v1/events/stream` — SSE real-time event stream
+
+### Client Admin API
+
+When `admin_addr` and `admin_port` are configured on the client:
+
+- `GET /api/v1/status` — client connection status
+- `GET /api/v1/proxies` — list local proxies
+- `GET /api/v1/proxies/:name` — proxy detail
+- `POST /api/v1/proxies` — dynamically add a proxy (JSON body)
+- `DELETE /api/v1/proxies/:name` — remove a proxy
+- `POST /api/v1/reload` — reload config file, diff and apply changes
+
+Basic Auth is enforced when `admin_user` and `admin_pwd` are set.
+
+### Client CLI Commands
+
+```bash
+arpc run -c client.toml      # run client (default)
+arpc status -c client.toml   # show connection and proxy status
+arpc check -c client.toml    # diagnose all proxies
+arpc check ssh -c client.toml  # diagnose specific proxy
+```
+
+## Config Hot-Reload
+
+The client supports hot-reloading proxy configuration without restart:
+
+```bash
+# Via signal (Unix)
+kill -HUP $(pidof arpc)
+
+# Via API
+curl -X POST http://127.0.0.1:7400/api/v1/reload
+```
+
+Changed proxies are added/removed. Existing connections are not interrupted.
+
+## Graceful Shutdown
+
+Both server and client handle `Ctrl+C` / `SIGTERM` gracefully:
+
+- Server: stops accepting new connections, waits up to 30s for active connections to drain
+- Client: cleanly disconnects from server
+
+## Security
+
+### HMAC Authentication
+
+Tokens are never transmitted in plaintext. The client signs `HMAC-SHA256(token, timestamp)` and the server verifies the signature against all known tokens. A 5-minute anti-replay window is enforced.
+
+### Audit Logging
+
+The server emits structured JSON audit events via `tracing`:
+
+- `client_login` / `client_login_failed`
+- `client_disconnect`
+- `proxy_registered` / `proxy_rejected` / `proxy_closed`
+- `work_conn_auth_failed`
+
+### Multi-Tenant Runtime Limits
+
+Per-token rules can enforce runtime limits:
+
+```toml
+[[auth.rules]]
+token = "team-a"
+max_connections = 50
+bandwidth_limit_bytes = 10485760  # 10 MB/s
+allow_ports = [{ start = 6000, end = 6100 }]
+```
 
 ## Development
 

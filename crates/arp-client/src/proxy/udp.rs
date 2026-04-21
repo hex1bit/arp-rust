@@ -25,7 +25,7 @@ pub struct UdpProxy {
 
 impl UdpProxy {
     pub fn new(config: ProxyConfig) -> Self {
-        let force_secure = config.proxy_type == "sudp";
+        let force_secure = config.proxy_type == arp_common::config::ProxyType::Sudp;
         Self {
             name: config.name,
             local_ip: config.local_ip,

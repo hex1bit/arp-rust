@@ -1,10 +1,13 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::Stream;
 use serde::Serialize;
 use tracing::{error, info};
 
@@ -102,6 +105,7 @@ pub fn start_admin_server(bind_addr: String, bind_port: u16, state: AdminState) 
             .route("/api/v1/clients/:run_id", get(api_client_detail))
             .route("/api/v1/clients/:run_id/shutdown", post(api_client_shutdown))
             .route("/api/v1/xtcp/events", get(api_xtcp_events))
+            .route("/api/v1/events/stream", get(api_events_stream))
             .with_state(state);
 
         let addr = format!("{}:{}", bind_addr, bind_port);
@@ -293,7 +297,7 @@ async fn dashboard(State(state): State<AdminState>) -> impl IntoResponse {
 
 async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
     let status = state.status_snapshot().await;
-    let body = format!(
+    let mut body = format!(
         concat!(
             "arp_active_controls {}\n",
             "arp_active_proxies {}\n",
@@ -341,6 +345,24 @@ async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
         METRICS.xtcp_owner_requests_forwarded_total.load(std::sync::atomic::Ordering::Relaxed),
         METRICS.xtcp_responses_forwarded_total.load(std::sync::atomic::Ordering::Relaxed),
     );
+
+    // Per-proxy metrics
+    for (name, pm) in crate::metrics::list_proxy_metrics() {
+        use std::sync::atomic::Ordering::Relaxed;
+        body.push_str(&format!(
+            "arp_proxy_bytes_in{{proxy=\"{}\"}} {}\n\
+             arp_proxy_bytes_out{{proxy=\"{}\"}} {}\n\
+             arp_proxy_connections_total{{proxy=\"{}\"}} {}\n\
+             arp_proxy_connections_active{{proxy=\"{}\"}} {}\n\
+             arp_proxy_errors{{proxy=\"{}\"}} {}\n",
+            name, pm.bytes_in.load(Relaxed),
+            name, pm.bytes_out.load(Relaxed),
+            name, pm.connections_total.load(Relaxed),
+            name, pm.connections_active.load(Relaxed),
+            name, pm.errors.load(Relaxed),
+        ));
+    }
+
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -414,4 +436,25 @@ fn render_xtcp_events(items: &[crate::nathole::XtcpEvent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+async fn api_events_stream() -> Sse<impl Stream<Item = std::result::Result<SseEvent, Infallible>>> {
+    let mut rx = crate::audit::subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    yield Ok(SseEvent::default().data(json));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    yield Ok(SseEvent::default().data(format!("{{\"event\":\"lagged\",\"missed\":{}}}", n)));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
