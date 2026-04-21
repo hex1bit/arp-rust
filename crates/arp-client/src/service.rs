@@ -4,17 +4,19 @@ use tracing::{error, info, warn};
 use arp_common::config::ClientConfig;
 use arp_common::Result;
 
+use crate::admin;
 use crate::control::Control;
 use crate::proxy::ProxyManager;
 
 pub struct Service {
     config: Arc<ClientConfig>,
+    config_path: String,
 }
 
 impl Service {
-    pub async fn new(config: ClientConfig) -> Result<Self> {
+    pub async fn new(config: ClientConfig, config_path: String) -> Result<Self> {
         let config = Arc::new(config);
-        Ok(Self { config })
+        Ok(Self { config, config_path })
     }
 
     pub async fn run(self) -> Result<()> {
@@ -49,6 +51,52 @@ impl Service {
 
             // Reset backoff on successful connection
             retry_count = 0;
+
+            // Start admin API server if configured
+            if self.config.admin_port > 0 {
+                let admin_addr = if self.config.admin_addr.is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    self.config.admin_addr.clone()
+                };
+                admin::start_admin_server(
+                    admin_addr,
+                    self.config.admin_port,
+                    admin::AdminState {
+                        control: control.clone(),
+                        config: self.config.clone(),
+                    },
+                );
+            }
+
+            // Start SIGHUP listener for config hot-reload
+            #[cfg(unix)]
+            {
+                let ctrl = control.clone();
+                let path = self.config_path.clone();
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sighup = match signal(SignalKind::hangup()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to register SIGHUP handler: {}", e);
+                            return;
+                        }
+                    };
+                    loop {
+                        sighup.recv().await;
+                        info!("Received SIGHUP, reloading config from {}", path);
+                        match ctrl.reload_proxies(&path).await {
+                            Ok((added, removed)) => {
+                                info!("SIGHUP reload: {} added, {} removed", added, removed);
+                            }
+                            Err(e) => {
+                                error!("SIGHUP reload failed: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
 
             match control.run().await {
                 Ok(()) => {

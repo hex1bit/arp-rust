@@ -1,9 +1,56 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyType {
+    Tcp,
+    Http,
+    Https,
+    Udp,
+    Stcp,
+    Sudp,
+    Xtcp,
+}
+
+impl fmt::Display for ProxyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProxyType::Tcp => write!(f, "tcp"),
+            ProxyType::Http => write!(f, "http"),
+            ProxyType::Https => write!(f, "https"),
+            ProxyType::Udp => write!(f, "udp"),
+            ProxyType::Stcp => write!(f, "stcp"),
+            ProxyType::Sudp => write!(f, "sudp"),
+            ProxyType::Xtcp => write!(f, "xtcp"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportProtocol {
+    Tcp,
+    Kcp,
+    Quic,
+    Websocket,
+}
+
+impl fmt::Display for TransportProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransportProtocol::Tcp => write!(f, "tcp"),
+            TransportProtocol::Kcp => write!(f, "kcp"),
+            TransportProtocol::Quic => write!(f, "quic"),
+            TransportProtocol::Websocket => write!(f, "websocket"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -39,6 +86,12 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub log_level: String,
+
+    #[serde(default)]
+    pub log_file: String,
+
+    #[serde(default = "default_log_max_days")]
+    pub log_max_days: u32,
 
     #[serde(default)]
     pub auth: AuthConfig,
@@ -78,6 +131,12 @@ pub struct ClientConfig {
 
     #[serde(default)]
     pub log_level: String,
+
+    #[serde(default)]
+    pub log_file: String,
+
+    #[serde(default = "default_log_max_days")]
+    pub log_max_days: u32,
 
     #[serde(default)]
     pub auth: AuthConfig,
@@ -143,7 +202,7 @@ pub struct OidcConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
     #[serde(default = "default_protocol")]
-    pub protocol: String,
+    pub protocol: TransportProtocol,
 
     #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
@@ -201,7 +260,7 @@ pub struct ProxyConfig {
     pub name: String,
 
     #[serde(rename = "type")]
-    pub proxy_type: String,
+    pub proxy_type: ProxyType,
 
     #[serde(default = "default_local_ip")]
     pub local_ip: String,
@@ -356,6 +415,14 @@ pub struct AuthRule {
 
     #[serde(default)]
     pub max_pool_count: u32,
+
+    /// Maximum concurrent connections per client (0 = unlimited).
+    #[serde(default)]
+    pub max_connections: u32,
+
+    /// Bandwidth limit in bytes/sec per client (0 = unlimited).
+    #[serde(default)]
+    pub bandwidth_limit_bytes: u64,
 }
 
 impl ServerConfig {
@@ -372,16 +439,7 @@ impl ServerConfig {
             return Err(Error::Config("bind_port cannot be 0".to_string()));
         }
         self.auth.validate()?;
-        match self.transport.protocol.as_str() {
-            "tcp" | "kcp" | "quic" | "websocket" => {}
-            other => {
-                return Err(Error::Config(format!(
-                    "unsupported transport.protocol: {}",
-                    other
-                )));
-            }
-        }
-        if self.transport.protocol == "quic"
+        if self.transport.protocol == TransportProtocol::Quic
             && (self.transport.tls.cert_file.is_empty() || self.transport.tls.key_file.is_empty())
         {
             return Err(Error::Config(
@@ -389,7 +447,7 @@ impl ServerConfig {
                     .to_string(),
             ));
         }
-        if self.transport.protocol == "websocket"
+        if self.transport.protocol == TransportProtocol::Websocket
             && self.transport.tls.enable
             && (self.transport.tls.cert_file.is_empty() || self.transport.tls.key_file.is_empty())
         {
@@ -419,41 +477,30 @@ impl ClientConfig {
         if self.server_port == 0 {
             return Err(Error::Config("server_port cannot be 0".to_string()));
         }
-        match self.transport.protocol.as_str() {
-            "tcp" | "kcp" | "quic" | "websocket" => {}
-            other => {
-                return Err(Error::Config(format!(
-                    "unsupported transport.protocol: {}",
-                    other
-                )));
-            }
-        }
-        if (self.transport.protocol == "quic"
-            || (self.transport.protocol == "websocket" && self.transport.tls.enable)
-            || (self.transport.protocol == "tcp" && self.transport.tls.enable))
+        let proto = self.transport.protocol;
+        let proto_label = if proto == TransportProtocol::Websocket {
+            "websocket + tls".to_string()
+        } else {
+            proto.to_string()
+        };
+        if (proto == TransportProtocol::Quic
+            || (proto == TransportProtocol::Websocket && self.transport.tls.enable)
+            || (proto == TransportProtocol::Tcp && self.transport.tls.enable))
             && self.transport.tls.trusted_ca_file.trim().is_empty()
         {
             return Err(Error::Config(format!(
                 "{} transport requires transport.tls.trusted_ca_file",
-                if self.transport.protocol == "websocket" {
-                    "websocket + tls"
-                } else {
-                    self.transport.protocol.as_str()
-                }
+                proto_label
             )));
         }
-        if (self.transport.protocol == "quic"
-            || (self.transport.protocol == "websocket" && self.transport.tls.enable))
+        if (proto == TransportProtocol::Quic
+            || (proto == TransportProtocol::Websocket && self.transport.tls.enable))
             && self.server_addr.parse::<std::net::IpAddr>().is_ok()
             && self.transport.tls.server_name.trim().is_empty()
         {
             return Err(Error::Config(format!(
                 "{} transport with IP server_addr requires transport.tls.server_name",
-                if self.transport.protocol == "websocket" {
-                    "websocket + tls"
-                } else {
-                    self.transport.protocol.as_str()
-                }
+                proto_label
             )));
         }
         for proxy in &self.proxies {
@@ -498,9 +545,6 @@ impl ProxyConfig {
         if self.name.is_empty() {
             return Err(Error::Config("proxy name cannot be empty".to_string()));
         }
-        if self.proxy_type.is_empty() {
-            return Err(Error::Config("proxy type cannot be empty".to_string()));
-        }
 
         if self.local_port == 0 {
             return Err(Error::Config(format!(
@@ -509,13 +553,14 @@ impl ProxyConfig {
             )));
         }
 
-        if self.proxy_type == "http" || self.proxy_type == "https" {
-            if self.custom_domains.is_empty() && self.subdomain.trim().is_empty() {
-                return Err(Error::Config(format!(
-                    "proxy {} of type {} requires custom_domains or subdomain",
-                    self.name, self.proxy_type
-                )));
-            }
+        if (self.proxy_type == ProxyType::Http || self.proxy_type == ProxyType::Https)
+            && self.custom_domains.is_empty()
+            && self.subdomain.trim().is_empty()
+        {
+            return Err(Error::Config(format!(
+                "proxy {} of type {} requires custom_domains or subdomain",
+                self.name, self.proxy_type
+            )));
         }
 
         if self.use_encryption && self.sk.trim().is_empty() {
@@ -525,7 +570,7 @@ impl ProxyConfig {
             )));
         }
 
-        if (self.proxy_type == "stcp" || self.proxy_type == "sudp" || self.proxy_type == "xtcp")
+        if matches!(self.proxy_type, ProxyType::Stcp | ProxyType::Sudp | ProxyType::Xtcp)
             && self.sk.trim().is_empty()
         {
             return Err(Error::Config(format!(
@@ -558,8 +603,8 @@ fn default_local_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-fn default_protocol() -> String {
-    "tcp".to_string()
+fn default_protocol() -> TransportProtocol {
+    TransportProtocol::Tcp
 }
 
 fn default_tcp_mux() -> bool {
@@ -582,14 +627,18 @@ fn default_xtcp_punch_timeout_secs() -> u64 {
     12
 }
 
+fn default_log_max_days() -> u32 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn base_proxy(proxy_type: &str) -> ProxyConfig {
+    fn base_proxy(proxy_type: ProxyType) -> ProxyConfig {
         ProxyConfig {
             name: "p1".to_string(),
-            proxy_type: proxy_type.to_string(),
+            proxy_type,
             local_ip: "127.0.0.1".to_string(),
             local_port: 8080,
             remote_port: 0,
@@ -614,17 +663,17 @@ mod tests {
 
     #[test]
     fn test_http_proxy_requires_domain_or_subdomain() {
-        let proxy = base_proxy("http");
+        let proxy = base_proxy(ProxyType::Http);
         assert!(proxy.validate().is_err());
 
-        let mut with_domain = base_proxy("http");
+        let mut with_domain = base_proxy(ProxyType::Http);
         with_domain.custom_domains = vec!["app.example.com".to_string()];
         assert!(with_domain.validate().is_ok());
     }
 
     #[test]
     fn test_https_proxy_requires_local_port() {
-        let mut proxy = base_proxy("https");
+        let mut proxy = base_proxy(ProxyType::Https);
         proxy.local_port = 0;
         proxy.custom_domains = vec!["secure.example.com".to_string()];
         assert!(proxy.validate().is_err());
@@ -632,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_encryption_requires_sk() {
-        let mut proxy = base_proxy("udp");
+        let mut proxy = base_proxy(ProxyType::Udp);
         proxy.use_encryption = true;
         proxy.sk = String::new();
         assert!(proxy.validate().is_err());
@@ -643,24 +692,24 @@ mod tests {
 
     #[test]
     fn test_stcp_sudp_require_sk() {
-        let stcp = base_proxy("stcp");
+        let stcp = base_proxy(ProxyType::Stcp);
         assert!(stcp.validate().is_err());
 
-        let mut stcp_ok = base_proxy("stcp");
+        let mut stcp_ok = base_proxy(ProxyType::Stcp);
         stcp_ok.sk = "secret".to_string();
         assert!(stcp_ok.validate().is_ok());
 
-        let sudp = base_proxy("sudp");
+        let sudp = base_proxy(ProxyType::Sudp);
         assert!(sudp.validate().is_err());
 
-        let mut sudp_ok = base_proxy("sudp");
+        let mut sudp_ok = base_proxy(ProxyType::Sudp);
         sudp_ok.sk = "secret".to_string();
         assert!(sudp_ok.validate().is_ok());
 
-        let xtcp = base_proxy("xtcp");
+        let xtcp = base_proxy(ProxyType::Xtcp);
         assert!(xtcp.validate().is_err());
 
-        let mut xtcp_ok = base_proxy("xtcp");
+        let mut xtcp_ok = base_proxy(ProxyType::Xtcp);
         xtcp_ok.sk = "secret".to_string();
         assert!(xtcp_ok.validate().is_ok());
     }
@@ -672,9 +721,11 @@ mod tests {
             server_port: 7000,
             client_id: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
-                protocol: "websocket".to_string(),
+                protocol: TransportProtocol::Websocket,
                 tls: TlsConfig {
                     enable: true,
                     ..TlsConfig::default()
@@ -698,9 +749,11 @@ mod tests {
             server_port: 7000,
             client_id: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
-                protocol: "websocket".to_string(),
+                protocol: TransportProtocol::Websocket,
                 tls: TlsConfig {
                     enable: true,
                     trusted_ca_file: "ca.pem".to_string(),
@@ -732,9 +785,11 @@ mod tests {
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             log_level: String::new(),
+            log_file: String::new(),
+            log_max_days: 1,
             auth: AuthConfig::default(),
             transport: TransportConfig {
-                protocol: "websocket".to_string(),
+                protocol: TransportProtocol::Websocket,
                 tls: TlsConfig {
                     enable: true,
                     ..TlsConfig::default()

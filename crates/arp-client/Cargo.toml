@@ -34,3 +34,5 @@ rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio_kcp = { workspace = true }
 quinn = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }

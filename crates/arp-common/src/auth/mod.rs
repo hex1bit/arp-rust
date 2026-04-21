@@ -1,9 +1,14 @@
 use crate::config::{AuthConfig, AuthRule, PortRange};
+use crate::crypto::AuthSigner;
 use crate::error::{Error, Result};
 use crate::protocol::{LoginMsg, NewProxyMsg, NewWorkConnMsg, PingMsg};
 
+/// Maximum allowed clock skew between client and server (seconds).
+const MAX_TIMESTAMP_SKEW: i64 = 300;
+
 pub trait Authenticator: Send + Sync {
-    fn verify_login(&self, msg: &LoginMsg) -> Result<()>;
+    /// Verify login credentials. Returns the matched raw token on success.
+    fn verify_login(&self, msg: &LoginMsg) -> Result<String>;
     fn verify_new_work_conn(&self, msg: &NewWorkConnMsg) -> Result<()>;
     fn verify_ping(&self, msg: &PingMsg) -> Result<()>;
     fn authorize_proxy(&self, privilege_key: &str, pool_count: u32, msg: &NewProxyMsg) -> Result<()>;
@@ -24,14 +29,39 @@ impl TokenAuth {
         }
     }
 
-    fn is_known_token(&self, token: &str) -> bool {
-        token == self.token
-            || self.additional_tokens.iter().any(|item| item == token)
-            || self.rules.iter().any(|rule| rule.token == token)
+    /// Check if the given HMAC signature matches any known token.
+    /// The `message` is the string that was signed (typically a timestamp).
+    /// Returns the matching raw token string, or None.
+    fn find_matching_token(&self, signature: &str, message: &str) -> Option<String> {
+        if AuthSigner::verify(&self.token, message, signature) {
+            return Some(self.token.clone());
+        }
+        for t in &self.additional_tokens {
+            if AuthSigner::verify(t, message, signature) {
+                return Some(t.clone());
+            }
+        }
+        for rule in &self.rules {
+            if AuthSigner::verify(&rule.token, message, signature) {
+                return Some(rule.token.clone());
+            }
+        }
+        None
     }
 
     fn matching_rule(&self, token: &str) -> Option<&AuthRule> {
         self.rules.iter().find(|rule| rule.token == token)
+    }
+
+    fn check_timestamp(ts: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if (now - ts).abs() > MAX_TIMESTAMP_SKEW {
+            return Err(Error::Auth(format!(
+                "timestamp skew too large: client={}, server={}, diff={}s, max={}s",
+                ts, now, (now - ts).abs(), MAX_TIMESTAMP_SKEW
+            )));
+        }
+        Ok(())
     }
 
     fn validate_rule_login(&self, rule: &AuthRule, msg: &LoginMsg) -> Result<()> {
@@ -114,19 +144,25 @@ impl TokenAuth {
 }
 
 impl Authenticator for TokenAuth {
-    fn verify_login(&self, msg: &LoginMsg) -> Result<()> {
-        if !self.is_known_token(&msg.privilege_key) {
-            return Err(Error::Auth("Invalid token".to_string()));
-        }
-        if let Some(rule) = self.matching_rule(&msg.privilege_key) {
+    fn verify_login(&self, msg: &LoginMsg) -> Result<String> {
+        Self::check_timestamp(msg.timestamp)?;
+        let ts_str = msg.timestamp.to_string();
+        let raw_token = self
+            .find_matching_token(&msg.privilege_key, &ts_str)
+            .ok_or_else(|| Error::Auth("Invalid token (HMAC mismatch)".to_string()))?;
+        if let Some(rule) = self.matching_rule(&raw_token) {
             self.validate_rule_login(rule, msg)?;
         }
-        Ok(())
+        Ok(raw_token)
     }
 
     fn verify_new_work_conn(&self, msg: &NewWorkConnMsg) -> Result<()> {
-        if !self.is_known_token(&msg.privilege_key) {
-            return Err(Error::Auth("Invalid token".to_string()));
+        // NewWorkConn uses run_id as HMAC message (known to both client and server).
+        let found = self
+            .find_matching_token(&msg.privilege_key, &msg.run_id)
+            .is_some();
+        if !found {
+            return Err(Error::Auth("Invalid token (HMAC mismatch)".to_string()));
         }
         Ok(())
     }
@@ -136,7 +172,11 @@ impl Authenticator for TokenAuth {
     }
 
     fn authorize_proxy(&self, privilege_key: &str, pool_count: u32, msg: &NewProxyMsg) -> Result<()> {
-        if !self.is_known_token(privilege_key) {
+        // privilege_key here is the raw token matched during login
+        let is_known = privilege_key == self.token
+            || self.additional_tokens.iter().any(|t| t == privilege_key)
+            || self.rules.iter().any(|r| r.token == privilege_key);
+        if !is_known {
             return Err(Error::Auth("Invalid token".to_string()));
         }
         if let Some(rule) = self.matching_rule(privilege_key) {
@@ -174,6 +214,7 @@ pub fn create_authenticator(config: &AuthConfig) -> Result<Box<dyn Authenticator
 mod tests {
     use super::*;
     use crate::config::OidcConfig;
+    use crate::crypto::AuthSigner;
 
     fn token_config() -> AuthConfig {
         AuthConfig {
@@ -191,12 +232,15 @@ mod tests {
                 allow_domain_suffixes: vec!["example.com".to_string()],
                 allow_subdomain_prefixes: vec!["team-".to_string()],
                 max_pool_count: 2,
+                max_connections: 0,
+                bandwidth_limit_bytes: 0,
             }],
             oidc: OidcConfig::default(),
         }
     }
 
     fn login(token: &str, pool_count: u32) -> LoginMsg {
+        let ts = chrono::Utc::now().timestamp();
         LoginMsg {
             version: "0.1.0".to_string(),
             hostname: "test".to_string(),
@@ -204,8 +248,8 @@ mod tests {
             arch: "x86_64".to_string(),
             user: "test".to_string(),
             client_id: "client-a".to_string(),
-            timestamp: 123456,
-            privilege_key: token.to_string(),
+            timestamp: ts,
+            privilege_key: AuthSigner::sign(token, &ts.to_string()),
             run_id: "".to_string(),
             pool_count,
         }

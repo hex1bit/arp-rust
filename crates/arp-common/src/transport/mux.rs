@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Error, Result};
@@ -5,7 +6,7 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub enum MuxFrame {
     Open { stream_id: u32 },
-    Data { stream_id: u32, payload: Vec<u8> },
+    Data { stream_id: u32, payload: Bytes },
     Close { stream_id: u32 },
     Ping,
     Pong,
@@ -72,7 +73,10 @@ where
             }
             let mut payload = vec![0u8; len];
             reader.read_exact(&mut payload).await.map_err(Error::Io)?;
-            Ok(MuxFrame::Data { stream_id, payload })
+            Ok(MuxFrame::Data {
+                stream_id,
+                payload: Bytes::from(payload),
+            })
         }
         FRAME_CLOSE => {
             let stream_id = reader.read_u32().await.map_err(Error::Io)?;

@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -35,7 +36,7 @@ pub struct Control {
     control_manager: Arc<ControlManager>,
     work_conn_req_tx: mpsc::Sender<WorkConnRequest>,
     work_conn_req_rx: tokio::sync::Mutex<mpsc::Receiver<WorkConnRequest>>,
-    pending_work_conns: tokio::sync::Mutex<Vec<WorkConnRequest>>,
+    pending_work_conns: tokio::sync::Mutex<VecDeque<WorkConnRequest>>,
     idle_work_conns: tokio::sync::Mutex<Vec<MessageTransport>>,
     outbound_tx: mpsc::Sender<Message>,
     outbound_rx: tokio::sync::Mutex<mpsc::Receiver<Message>>,
@@ -83,7 +84,7 @@ impl Control {
             control_manager,
             work_conn_req_tx,
             work_conn_req_rx: tokio::sync::Mutex::new(work_conn_req_rx),
-            pending_work_conns: tokio::sync::Mutex::new(Vec::new()),
+            pending_work_conns: tokio::sync::Mutex::new(VecDeque::new()),
             idle_work_conns: tokio::sync::Mutex::new(Vec::new()),
             outbound_tx,
             outbound_rx: tokio::sync::Mutex::new(outbound_rx),
@@ -266,7 +267,7 @@ impl Control {
         let req_proxy_name = work_conn_req.proxy_name.clone();
         {
             let mut pending = self.pending_work_conns.lock().await;
-            pending.push(work_conn_req);
+            pending.push_back(work_conn_req);
         }
 
         if let Err(e) = transport
@@ -276,7 +277,7 @@ impl Control {
             .await
         {
             let mut pending = self.pending_work_conns.lock().await;
-            pending.pop();
+            pending.pop_back();
             return Err(e);
         }
 
@@ -344,15 +345,28 @@ impl Control {
         let resp = match result {
             Ok(remote_addr) => {
                 metrics::inc_proxy_registrations();
+                crate::audit::emit(crate::audit::AuditEvent::ProxyRegistered {
+                    client_id: self.client_id.clone(),
+                    run_id: self.run_id.clone(),
+                    proxy_name: msg.proxy_name.clone(),
+                    proxy_type: msg.proxy_type.clone(),
+                    remote_addr: remote_addr.clone(),
+                });
                 NewProxyRespMsg {
-                proxy_name: msg.proxy_name.clone(),
-                remote_addr,
-                error: String::new(),
-            }
+                    proxy_name: msg.proxy_name.clone(),
+                    remote_addr,
+                    error: String::new(),
+                }
             },
             Err(e) => {
                 metrics::inc_proxy_registration_failures();
                 error!("Failed to register proxy {}: {}", msg.proxy_name, e);
+                crate::audit::emit(crate::audit::AuditEvent::ProxyRejected {
+                    client_id: self.client_id.clone(),
+                    run_id: self.run_id.clone(),
+                    proxy_name: msg.proxy_name.clone(),
+                    reason: e.to_string(),
+                });
                 NewProxyRespMsg {
                     proxy_name: msg.proxy_name.clone(),
                     remote_addr: String::new(),
@@ -366,6 +380,10 @@ impl Control {
 
     async fn handle_close_proxy(&self, msg: CloseProxyMsg) -> Result<()> {
         info!("Closing proxy: {}", msg.proxy_name);
+        crate::audit::emit(crate::audit::AuditEvent::ProxyClosed {
+            run_id: self.run_id.clone(),
+            proxy_name: msg.proxy_name.clone(),
+        });
         self.proxy_manager
             .unregister_proxy(&self.run_id, &msg.proxy_name)
             .await
@@ -411,7 +429,7 @@ impl Control {
                 debug!("Stored idle work connection for run_id: {}", self.run_id);
                 return Ok(());
             }
-            pending.remove(0)
+            pending.pop_front().unwrap()
         };
 
         if let Err(_) = work_conn_req.reply_tx.send(transport) {

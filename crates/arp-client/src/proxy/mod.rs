@@ -40,19 +40,13 @@ impl ProxyManager {
     }
 
     pub async fn register_proxy(&self, config: ProxyConfig) {
-        let proxy: Arc<dyn ClientProxy> = match config.proxy_type.as_str() {
-            "tcp" => Arc::new(TcpProxy::new(config)),
-            "stcp" => Arc::new(TcpProxy::new(config)),
-            // HTTP/HTTPS proxy on client side still dials local TCP service.
-            "http" => Arc::new(TcpProxy::new(config)),
-            "https" => Arc::new(TcpProxy::new(config)),
-            "udp" => Arc::new(UdpProxy::new(config)),
-            "sudp" => Arc::new(UdpProxy::new(config)),
-            "xtcp" => Arc::new(XtcpProxy::new(config)),
-            _ => {
-                tracing::warn!("Unsupported proxy type: {}", config.proxy_type);
-                return;
+        use arp_common::config::ProxyType;
+        let proxy: Arc<dyn ClientProxy> = match config.proxy_type {
+            ProxyType::Tcp | ProxyType::Stcp | ProxyType::Http | ProxyType::Https => {
+                Arc::new(TcpProxy::new(config))
             }
+            ProxyType::Udp | ProxyType::Sudp => Arc::new(UdpProxy::new(config)),
+            ProxyType::Xtcp => Arc::new(XtcpProxy::new(config)),
         };
 
         self.proxies.insert(proxy.name().to_string(), proxy);
@@ -67,6 +61,14 @@ impl ProxyManager {
             .get(name)
             .map(|entry| entry.is_available())
             .unwrap_or(false)
+    }
+
+    pub fn unregister_proxy(&self, name: &str) {
+        self.proxies.remove(name);
+    }
+
+    pub fn list_proxy_names(&self) -> Vec<String> {
+        self.proxies.iter().map(|e| e.key().clone()).collect()
     }
 
     pub async fn handle_nat_hole_client(&self, name: &str, visitor_addr: &str) -> Result<String> {

@@ -2,10 +2,28 @@ bind_addr = "0.0.0.0"
 bind_port = 17000
 
 log_level = "info"
+# Optional: write logs to file with daily rotation.
+# If not set, logs go to stdout.
+# log_file = "/var/log/arp/arps"
+# log_max_days = 1
+
+# Dashboard and admin API (optional).
+# Provides /healthz, /metrics, /api/v1/status, /api/v1/events/stream (SSE), etc.
+dashboard_addr = "0.0.0.0"
+dashboard_port = 17500
 
 [auth]
 method = "token"
 token = "replace_with_token"
+
+# Optional: fine-grained per-token rules with runtime limits.
+# [[auth.rules]]
+# token = "team-frontend"
+# allow_proxy_types = ["http", "https"]
+# allow_subdomain_prefixes = ["fe-"]
+# max_pool_count = 5
+# max_connections = 100           # runtime: max concurrent connections
+# bandwidth_limit_bytes = 10485760  # runtime: 10 MB/s bandwidth cap
 
 [transport]
 protocol = "tcp"

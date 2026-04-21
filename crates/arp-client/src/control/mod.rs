@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::{net::ToSocketAddrs, time::Duration};
+use std::time::Duration;
 
 use quinn::{ClientConfig as QuicClientConfig, Endpoint, TransportConfig as QuicTransportConfig};
 use tokio::io::AsyncWriteExt;
@@ -8,14 +8,15 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tokio_kcp::{KcpConfig, KcpNoDelayConfig, KcpStream};
+use tokio_kcp::KcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async;
 use tracing::{debug, error, info, warn};
 
-use arp_common::config::{ClientConfig, VisitorConfig};
+use arp_common::config::{ClientConfig, ProxyConfig, VisitorConfig};
+use arp_common::crypto::AuthSigner;
 use arp_common::protocol::{
-    LoginMsg, LoginRespMsg, Message, NatHoleRespMsg, NatHoleVisitorMsg, NewProxyMsg,
+    CloseProxyMsg, LoginMsg, LoginRespMsg, Message, NatHoleRespMsg, NatHoleVisitorMsg, NewProxyMsg,
     NewProxyRespMsg, PingMsg, PongMsg,
 };
 use arp_common::transport::quic_stream::QuicBiStream;
@@ -50,10 +51,11 @@ enum CachedTransportConfig {
 
 impl CachedTransportConfig {
     fn build(config: &ClientConfig) -> Result<Self> {
-        match config.transport.protocol.as_str() {
-            "kcp" => Ok(Self::Kcp),
-            "quic" => Ok(Self::Quic(build_quic_client_config(config)?)),
-            "websocket" => {
+        use arp_common::config::TransportProtocol;
+        match config.transport.protocol {
+            TransportProtocol::Kcp => Ok(Self::Kcp),
+            TransportProtocol::Quic => Ok(Self::Quic(build_quic_client_config(config)?)),
+            TransportProtocol::Websocket => {
                 if config.transport.tls.enable {
                     let connector = build_tls_connector(config)?;
                     let server_name = tls_server_name(config)?;
@@ -65,7 +67,7 @@ impl CachedTransportConfig {
                     Ok(Self::Ws)
                 }
             }
-            _ => {
+            TransportProtocol::Tcp => {
                 if config.transport.tls.enable {
                     let connector = build_tls_connector(config)?;
                     let server_name = tls_server_name(config)?;
@@ -89,6 +91,7 @@ pub struct Control {
     cmd_tx: mpsc::Sender<ControlCommand>,
     cmd_rx: tokio::sync::Mutex<mpsc::Receiver<ControlCommand>>,
     pending_xtcp: tokio::sync::Mutex<Option<oneshot::Sender<Result<NatHoleRespMsg>>>>,
+    pending_proxy_resp: tokio::sync::Mutex<Option<PendingProxyResp>>,
     /// Tracks the last time a Pong was received (or when we connected), as Unix timestamp seconds.
     last_pong: Arc<AtomicI64>,
     /// Pre-built transport config (TLS context, etc.) to avoid rebuilding per work connection.
@@ -103,6 +106,21 @@ enum ControlCommand {
         visitor_addr: String,
         reply_tx: oneshot::Sender<Result<NatHoleRespMsg>>,
     },
+    RegisterProxy {
+        proxy_config: ProxyConfig,
+        multiplexer: String,
+        reply_tx: oneshot::Sender<Result<String>>,
+    },
+    CloseProxy {
+        proxy_name: String,
+        reply_tx: oneshot::Sender<Result<()>>,
+    },
+}
+
+struct PendingProxyResp {
+    reply_tx: oneshot::Sender<Result<String>>,
+    proxy_config: ProxyConfig,
+    multiplexer: String,
 }
 
 impl Control {
@@ -129,6 +147,7 @@ impl Control {
             cmd_tx,
             cmd_rx: tokio::sync::Mutex::new(cmd_rx),
             pending_xtcp: tokio::sync::Mutex::new(None),
+            pending_proxy_resp: tokio::sync::Mutex::new(None),
             last_pong: Arc::new(AtomicI64::new(chrono::Utc::now().timestamp())),
             cached_transport_config,
             cancel: CancellationToken::new(),
@@ -137,6 +156,104 @@ impl Control {
 
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    /// Dynamically register a proxy at runtime. Returns the remote address on success.
+    pub async fn register_proxy_dynamic(&self, proxy_config: ProxyConfig) -> Result<String> {
+        let has_lb_group = !proxy_config.load_balancer.group.trim().is_empty();
+        let multiplexer = if proxy_config.multiplexer.is_empty()
+            && self.config.transport.tcp_mux
+            && matches!(
+                proxy_config.proxy_type,
+                arp_common::config::ProxyType::Tcp
+                    | arp_common::config::ProxyType::Http
+                    | arp_common::config::ProxyType::Https
+            )
+            && !has_lb_group
+        {
+            "tcp_mux".to_string()
+        } else {
+            proxy_config.multiplexer.clone()
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::RegisterProxy {
+                proxy_config,
+                multiplexer,
+                reply_tx: tx,
+            })
+            .await
+            .map_err(|_| Error::Transport("control command channel closed".to_string()))?;
+        match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::Transport("register proxy channel closed".to_string())),
+            Err(_) => {
+                self.pending_proxy_resp.lock().await.take();
+                Err(Error::Timeout("register proxy timeout".to_string()))
+            }
+        }
+    }
+
+    /// Dynamically close/remove a proxy at runtime.
+    pub async fn close_proxy_dynamic(&self, proxy_name: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ControlCommand::CloseProxy {
+                proxy_name,
+                reply_tx: tx,
+            })
+            .await
+            .map_err(|_| Error::Transport("control command channel closed".to_string()))?;
+        match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::Transport("close proxy channel closed".to_string())),
+            Err(_) => Err(Error::Timeout("close proxy timeout".to_string())),
+        }
+    }
+
+    pub fn proxy_manager(&self) -> &Arc<ProxyManager> {
+        &self.proxy_manager
+    }
+
+    pub fn config(&self) -> &Arc<ClientConfig> {
+        &self.config
+    }
+
+    pub async fn run_id_snapshot(&self) -> String {
+        self.run_id.read().await.clone()
+    }
+
+    /// Reload proxies from a new config: remove stale proxies, add new ones.
+    /// Returns (added, removed) counts.
+    pub async fn reload_proxies(&self, config_path: &str) -> Result<(usize, usize)> {
+        let new_config = ClientConfig::from_file(config_path)?;
+        let current_names = self.proxy_manager.list_proxy_names();
+        let new_names: Vec<String> = new_config.proxies.iter().map(|p| p.name.clone()).collect();
+
+        let mut removed = 0;
+        for name in &current_names {
+            if !new_names.contains(name) {
+                if let Err(e) = self.close_proxy_dynamic(name.clone()).await {
+                    error!("reload: failed to close proxy {}: {}", name, e);
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+
+        let mut added = 0;
+        for proxy in &new_config.proxies {
+            if !current_names.contains(&proxy.name) {
+                match self.register_proxy_dynamic(proxy.clone()).await {
+                    Ok(_) => added += 1,
+                    Err(e) => error!("reload: failed to register proxy {}: {}", proxy.name, e),
+                }
+            }
+        }
+
+        info!("Config reload complete: {} added, {} removed", added, removed);
+        Ok((added, removed))
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -151,6 +268,11 @@ impl Control {
         *self.run_id.write().await = String::new();
         if let Some(tx) = self.pending_xtcp.lock().await.take() {
             let _ = tx.send(Err(Error::Transport(
+                "control shutting down".to_string(),
+            )));
+        }
+        if let Some(p) = self.pending_proxy_resp.lock().await.take() {
+            let _ = p.reply_tx.send(Err(Error::Transport(
                 "control shutting down".to_string(),
             )));
         }
@@ -231,6 +353,7 @@ impl Control {
     async fn login(&self) -> Result<()> {
         info!("Logging in to server...");
 
+        let now = chrono::Utc::now().timestamp();
         let login_msg = LoginMsg {
             version: env!("CARGO_PKG_VERSION").to_string(),
             hostname: hostname::get()
@@ -241,8 +364,8 @@ impl Control {
             arch: std::env::consts::ARCH.to_string(),
             user: whoami::username(),
             client_id: self.effective_client_id(),
-            timestamp: chrono::Utc::now().timestamp(),
-            privilege_key: self.config.auth.token.clone(),
+            timestamp: now,
+            privilege_key: AuthSigner::sign(&self.config.auth.token, &now.to_string()),
             run_id: String::new(),
             pool_count: self.config.transport.pool_count,
         };
@@ -289,7 +412,12 @@ impl Control {
             let has_lb_group = !proxy_config.load_balancer.group.trim().is_empty();
             let multiplexer = if proxy_config.multiplexer.is_empty()
                 && self.config.transport.tcp_mux
-                && proxy_config.proxy_type == "tcp"
+                && matches!(
+                    proxy_config.proxy_type,
+                    arp_common::config::ProxyType::Tcp
+                        | arp_common::config::ProxyType::Http
+                        | arp_common::config::ProxyType::Https
+                )
                 && !has_lb_group
             {
                 "tcp_mux".to_string()
@@ -304,7 +432,7 @@ impl Control {
             });
             let msg = NewProxyMsg {
                 proxy_name: proxy_config.name.clone(),
-                proxy_type: proxy_config.proxy_type.clone(),
+                proxy_type: proxy_config.proxy_type.to_string(),
                 use_encryption: proxy_config.use_encryption,
                 use_compression: proxy_config.use_compression,
                 local_ip: proxy_config.local_ip.clone(),
@@ -597,8 +725,8 @@ impl Control {
                     let msg = match msg? {
                         Some(msg) => msg,
                         None => {
-                            info!("Connection closed by server");
-                            return Ok(());
+                            warn!("Connection closed by server, will reconnect");
+                            return Err(Error::ConnectionClosed);
                         }
                     };
                     match msg {
@@ -639,6 +767,28 @@ impl Control {
                                 timestamp: chrono::Utc::now().timestamp(),
                             }))
                             .await?;
+                        }
+                        Message::NewProxyResp(resp) => {
+                            debug!("Received NewProxyResp for {}", resp.proxy_name);
+                            if let Some(pending) = self.pending_proxy_resp.lock().await.take() {
+                                if !resp.error.is_empty() {
+                                    let _ = pending.reply_tx.send(Err(Error::Proxy(format!(
+                                        "proxy {} registration failed: {}",
+                                        resp.proxy_name, resp.error
+                                    ))));
+                                } else {
+                                    info!(
+                                        "Dynamic proxy {} registered, remote address: {}",
+                                        resp.proxy_name, resp.remote_addr
+                                    );
+                                    let mut effective = pending.proxy_config;
+                                    effective.multiplexer = pending.multiplexer;
+                                    self.proxy_manager.register_proxy(effective).await;
+                                    let _ = pending.reply_tx.send(Ok(resp.remote_addr));
+                                }
+                            } else {
+                                warn!("Received unexpected NewProxyResp");
+                            }
                         }
                         Message::Pong(pong) => {
                             debug!("Received Pong (server_ts={})", pong.timestamp);
@@ -728,6 +878,61 @@ impl Control {
                     return Err(e);
                 }
             }
+            ControlCommand::RegisterProxy {
+                proxy_config,
+                multiplexer,
+                reply_tx,
+            } => {
+                {
+                    let mut pending = self.pending_proxy_resp.lock().await;
+                    if pending.is_some() {
+                        let _ = reply_tx.send(Err(Error::Proxy(
+                            "another proxy registration is in progress".to_string(),
+                        )));
+                        return Ok(());
+                    }
+                    *pending = Some(PendingProxyResp {
+                        reply_tx,
+                        proxy_config: proxy_config.clone(),
+                        multiplexer: multiplexer.clone(),
+                    });
+                }
+                let extra = serde_json::json!({
+                    "load_balancer": {
+                        "group": proxy_config.load_balancer.group,
+                        "group_key": proxy_config.load_balancer.group_key,
+                    }
+                });
+                let msg = NewProxyMsg {
+                    proxy_name: proxy_config.name.clone(),
+                    proxy_type: proxy_config.proxy_type.to_string(),
+                    use_encryption: proxy_config.use_encryption,
+                    use_compression: proxy_config.use_compression,
+                    local_ip: proxy_config.local_ip.clone(),
+                    local_port: proxy_config.local_port,
+                    remote_port: proxy_config.remote_port,
+                    custom_domains: proxy_config.custom_domains.clone(),
+                    subdomain: proxy_config.subdomain.clone(),
+                    locations: proxy_config.locations.clone(),
+                    host_header_rewrite: proxy_config.host_header_rewrite.clone(),
+                    sk: proxy_config.sk.clone(),
+                    multiplexer,
+                    fallback_to_relay: proxy_config.fallback_to_relay,
+                    extra,
+                };
+                if let Err(e) = self.send_control_message(Message::NewProxy(msg)).await {
+                    if let Some(p) = self.pending_proxy_resp.lock().await.take() {
+                        let _ = p.reply_tx.send(Err(e));
+                    }
+                }
+            }
+            ControlCommand::CloseProxy {
+                proxy_name,
+                reply_tx,
+            } => {
+                let result = self.handle_close_proxy_cmd(&proxy_name).await;
+                let _ = reply_tx.send(result);
+            }
         }
         Ok(())
     }
@@ -743,6 +948,16 @@ impl Control {
         } else {
             warn!("received unexpected NatHoleResp without pending request");
         }
+    }
+
+    async fn handle_close_proxy_cmd(&self, proxy_name: &str) -> Result<()> {
+        self.send_control_message(Message::CloseProxy(CloseProxyMsg {
+            proxy_name: proxy_name.to_string(),
+        }))
+        .await?;
+        self.proxy_manager.unregister_proxy(proxy_name);
+        info!("Dynamic proxy {} closed", proxy_name);
+        Ok(())
     }
 
     async fn create_work_conn_static(
@@ -769,8 +984,8 @@ impl Control {
 
         transport
             .send(Message::NewWorkConn(arp_common::protocol::NewWorkConnMsg {
-                run_id,
-                privilege_key: config.auth.token.clone(),
+                run_id: run_id.clone(),
+                privilege_key: AuthSigner::sign(&config.auth.token, &run_id),
             }))
             .await?;
 
@@ -822,14 +1037,14 @@ async fn connect_server_transport_cached(
 ) -> Result<MessageTransport> {
     match cached {
         CachedTransportConfig::Kcp => {
-            let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
-            let stream = KcpStream::connect(&build_kcp_config(), server_addr)
+            let server_addr = arp_common::transport::resolve_socket_addr(&config.server_addr, config.server_port)?;
+            let stream = KcpStream::connect(&arp_common::transport::build_kcp_config(), server_addr)
                 .await
                 .map_err(|e| Error::Transport(format!("KCP connect failed: {}", e)))?;
             Ok(MessageTransport::from_stream(Box::new(stream)))
         }
         CachedTransportConfig::Quic(quic_config) => {
-            let server_addr = resolve_socket_addr(&config.server_addr, config.server_port)?;
+            let server_addr = arp_common::transport::resolve_socket_addr(&config.server_addr, config.server_port)?;
             let bind_addr = match server_addr {
                 std::net::SocketAddr::V4(_) => "0.0.0.0:0",
                 std::net::SocketAddr::V6(_) => "[::]:0",
@@ -928,16 +1143,6 @@ fn normalize_relay_addr(relay_addr: &str, server_addr: &str) -> String {
     format!("{}:{}", server_addr, sa.port())
 }
 
-fn build_kcp_config() -> KcpConfig {
-    let mut config = KcpConfig::default();
-    config.stream = true;
-    config.nodelay = KcpNoDelayConfig::fastest();
-    config.flush_write = true;
-    config.flush_acks_input = true;
-    config.session_expire = Duration::from_secs(120);
-    config
-}
-
 fn build_quic_client_config(config: &ClientConfig) -> Result<QuicClientConfig> {
     if config.transport.tls.trusted_ca_file.is_empty() {
         return Err(Error::Config(
@@ -967,14 +1172,6 @@ fn build_quic_client_config(config: &ClientConfig) -> Result<QuicClientConfig> {
     ));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
-}
-
-fn resolve_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| Error::Config(format!("Failed to resolve {}:{}: {}", host, port, e)))?
-        .next()
-        .ok_or_else(|| Error::Config(format!("No socket address resolved for {}:{}", host, port)))
 }
 
 fn build_tls_connector(config: &ClientConfig) -> Result<TlsConnector> {

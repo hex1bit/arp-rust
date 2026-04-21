@@ -34,6 +34,8 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 once_cell = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio_kcp = { workspace = true }
 quinn = { workspace = true }
