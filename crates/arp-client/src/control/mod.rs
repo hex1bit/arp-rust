@@ -686,9 +686,14 @@ impl Control {
             tokio::time::interval(Duration::from_secs(heartbeat_interval));
         heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Separate ticker for timeout detection — runs every 5s, does NO I/O,
+        // so it can always fire even when send/recv are stuck.
+        let mut timeout_checker = tokio::time::interval(Duration::from_secs(5));
+        timeout_checker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
-                _ = heartbeat_ticker.tick() => {
+                _ = timeout_checker.tick() => {
                     let now = chrono::Utc::now().timestamp();
                     let last = self.last_pong.load(Ordering::Relaxed);
                     if now - last > heartbeat_timeout as i64 {
@@ -698,11 +703,28 @@ impl Control {
                         );
                         return Err(Error::Timeout("heartbeat timeout".to_string()));
                     }
+                }
+                _ = heartbeat_ticker.tick() => {
                     debug!("Sending Ping to server");
-                    self.send_control_message(Message::Ping(PingMsg {
-                        timestamp: now,
-                    }))
-                    .await?;
+                    // Timeout the send itself — if WSS write is stuck, don't block forever
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        self.send_control_message(Message::Ping(PingMsg {
+                            timestamp: chrono::Utc::now().timestamp(),
+                        })),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!("Failed to send Ping: {}", e);
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            warn!("Ping send timed out (10s), connection may be stale");
+                            return Err(Error::Timeout("ping send timeout".to_string()));
+                        }
+                    }
                 }
                 cmd = self.recv_control_command() => {
                     if let Some(cmd) = cmd {
@@ -712,11 +734,19 @@ impl Control {
                     }
                 }
                 msg = self.recv_control_message() => {
-                    let msg = match msg? {
-                        Some(msg) => msg,
-                        None => {
+                    let msg = match msg {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => {
+                            // Read timeout — not a real disconnect.
+                            // Continue the loop so timeout_checker can fire.
+                            continue;
+                        }
+                        Err(Error::ConnectionClosed) => {
                             warn!("Connection closed by server, will reconnect");
                             return Err(Error::ConnectionClosed);
+                        }
+                        Err(e) => {
+                            return Err(e);
                         }
                     };
                     match msg {
@@ -822,14 +852,25 @@ impl Control {
         }
     }
 
+    /// Receive a message with a read timeout.
+    /// Returns `Ok(None)` on read timeout (not a real disconnect — lets the
+    /// select loop continue so the heartbeat timeout checker can run).
+    /// Returns `Err(ConnectionClosed)` on actual EOF.
     async fn recv_control_message(&self) -> Result<Option<Message>> {
         let mut transport = self.transport.lock().await;
-        transport.recv().await
+        match tokio::time::timeout(Duration::from_secs(60), transport.recv()).await {
+            Ok(Ok(Some(msg))) => Ok(Some(msg)),
+            Ok(Ok(None)) => Err(Error::ConnectionClosed), // real EOF
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(None), // read timed out, not a real disconnect
+        }
     }
 
     async fn send_control_message(&self, msg: Message) -> Result<()> {
         let mut transport = self.transport.lock().await;
-        transport.send(msg).await
+        tokio::time::timeout(Duration::from_secs(10), transport.send(msg))
+            .await
+            .map_err(|_| Error::Timeout("send message timeout (10s)".to_string()))?
     }
 
     async fn recv_control_command(&self) -> Option<ControlCommand> {
