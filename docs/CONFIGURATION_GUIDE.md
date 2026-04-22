@@ -76,8 +76,8 @@ Important fields:
 - `server_port`: control port on the server
 - `client_id`: stable identity of the client instance
 - `transport.pool_count`: number of pre-warmed work connections
-- `transport.heartbeat_interval`: client heartbeat period
-- `transport.heartbeat_timeout`: local timeout for detecting dead server connections
+- `transport.heartbeat_interval`: client heartbeat period (default: 30s)
+- `transport.heartbeat_timeout`: timeout for detecting dead connections (default: 90s). Since v0.4.2, the client uses a dedicated timeout checker (5s interval) that runs independently from network I/O, ensuring detection within `timeout + 5s` even when send/recv are stuck on degraded networks.
 - `[[proxies]]`: provider-side proxy definitions
 - `[[visitors]]`: visitor-side config for `xtcp`
 - `log_file`: optional path prefix for log file output (see section 14)
