@@ -4,6 +4,18 @@ All notable changes to ARP-Rust are documented in this file.
 
 ---
 
+## [0.4.1] — 2026-04-22
+
+### Added
+
+- Chinese documentation: `README-zh.md`, `docs/配置指南.md`, `docs/开发说明.md`
+
+### Fixed
+
+- Removed debug log (`TcpProxy::new` trace) inadvertently left in client proxy initialization
+
+---
+
 ## [0.4.0] — 2026-04-21
 
 Major release: transforms ARP-Rust from a basic tunnel tool into a production-grade, dynamically manageable tunnel platform.
