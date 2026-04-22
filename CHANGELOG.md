@@ -4,6 +4,28 @@ All notable changes to ARP-Rust are documented in this file.
 
 ---
 
+## [0.4.2] — 2026-04-22
+
+### Fixed
+
+- **Heartbeat timeout detection blocked by stuck network I/O** — when a WSS/TCP connection enters a half-open state (network degraded but TCP not closed), the client message loop could get stuck in `send_control_message` or `recv_control_message`, preventing the heartbeat timeout check from ever firing. Observed timeout values of 491s and 1050s instead of the configured 90s.
+- **Mux auto-enable incorrectly applied to HTTP/HTTPS proxies** — v0.4.0 extended mux to HTTP/HTTPS, but server-side vhost routing sends raw HTTP bytes over work connections, not mux frames. This caused `unknown mux frame type: 71` errors ('G' from "GET /"). Mux auto-enable is now restricted to TCP proxies only.
+
+### Improved
+
+- **Three-layer heartbeat defense against stuck connections:**
+  1. Separate `timeout_checker` (5s interval) — pure timestamp comparison with zero I/O, guaranteed to fire even when send/recv are blocked
+  2. Send timeout (10s) — Ping write wrapped in `tokio::time::timeout`, returns error immediately if WSS write is stuck
+  3. Recv timeout (60s) — `transport.recv()` wrapped in timeout, releases Mutex lock on timeout to let the select loop continue
+- Worst-case heartbeat timeout detection: 90s (configured) + 5s (checker interval) = **95s**, instead of the previous unbounded duration
+
+### Tested
+
+- Vhost HTTP routing: subdomain and custom domain both verified end-to-end
+- All 6 transport protocols re-verified: TCP, TCP+TLS, WS, WSS, KCP, QUIC
+
+---
+
 ## [0.4.1] — 2026-04-22
 
 ### Added

@@ -82,7 +82,8 @@ Before deploying ARP-Rust to the public internet, verify the following:
 - **SSE event stream** — `GET /api/v1/events/stream` for real-time server event monitoring
 - **Multi-tenant runtime limits** — per-token `max_connections` and `bandwidth_limit_bytes`
 - **Session-cached AES encryption** — avoids per-packet key derivation in STCP/SUDP
-- **Mux-first architecture** — TCP multiplexing enabled by default for TCP, HTTP, and HTTPS proxies
+- **Mux-first architecture** — TCP multiplexing enabled by default for TCP proxies, reducing connection overhead
+- **Robust heartbeat detection** — three-layer defense ensures timeout detection within 95s even on degraded networks
 - Admin endpoints for health, metrics, and proxy status
 - TOML-based configuration
 - File-based log output with daily rotation and auto-purge (`log_file`, `log_max_days`)
