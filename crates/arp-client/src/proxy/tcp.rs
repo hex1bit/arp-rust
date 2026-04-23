@@ -36,7 +36,10 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     pub fn new(config: ProxyConfig) -> Self {
-        let stcp = config.proxy_type == arp_common::config::ProxyType::Stcp;
+        // STCP provider handles work connections in plain TCP mode —
+        // access control is enforced by the server's visitor sk verification,
+        // not by encrypting the work connection data path.
+        let stcp = false;
         let tcp_mux = matches!(
             config.multiplexer.as_str(),
             "tcp_mux" | "mux" | "smux" | "yamux"

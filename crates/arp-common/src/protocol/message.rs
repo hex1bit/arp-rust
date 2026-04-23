@@ -17,6 +17,7 @@ pub enum Message {
     NatHoleVisitor(NatHoleVisitorMsg),
     NatHoleClient(NatHoleClientMsg),
     NatHoleResp(NatHoleRespMsg),
+    StcpVisitorConn(StcpVisitorConnMsg),
 }
 
 impl Message {
@@ -36,6 +37,7 @@ impl Message {
             Message::NatHoleVisitor(_) => b'i',
             Message::NatHoleClient(_) => b'n',
             Message::NatHoleResp(_) => b'm',
+            Message::StcpVisitorConn(_) => b'v',
         }
     }
 
@@ -55,6 +57,7 @@ impl Message {
             b'i' => Some("NatHoleVisitor"),
             b'n' => Some("NatHoleClient"),
             b'm' => Some("NatHoleResp"),
+            b'v' => Some("StcpVisitorConn"),
             _ => None,
         }
     }
@@ -201,6 +204,13 @@ pub struct NatHoleRespMsg {
     pub relay_addr: String,
     #[serde(default)]
     pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StcpVisitorConnMsg {
+    pub proxy_name: String,
+    pub sk_signature: String,
+    pub timestamp: i64,
 }
 
 fn default_true() -> bool {

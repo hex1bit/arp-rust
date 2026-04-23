@@ -303,6 +303,10 @@ impl Service {
             Message::NewWorkConn(work_conn_msg) => {
                 self.handle_new_work_conn(transport, work_conn_msg).await
             }
+            Message::StcpVisitorConn(stcp_msg) => {
+                self.handle_stcp_visitor_conn(transport, stcp_msg, peer_addr)
+                    .await
+            }
             _ => {
                 warn!("Unexpected message type from {}: {:?}", peer_addr, msg);
                 Err(Error::Protocol(format!(
@@ -437,6 +441,91 @@ impl Service {
             .ok_or_else(|| Error::Protocol(format!("Unknown run_id: {}", work_conn_msg.run_id)))?;
 
         control.handle_work_conn(transport).await
+    }
+
+    async fn handle_stcp_visitor_conn(
+        &self,
+        visitor_transport: MessageTransport,
+        msg: arp_common::protocol::StcpVisitorConnMsg,
+        peer_addr: String,
+    ) -> Result<()> {
+        debug!("StcpVisitorConn for proxy {} from {}", msg.proxy_name, peer_addr);
+
+        // 1. Look up the STCP provider in the secret registry
+        let info = self
+            .proxy_manager
+            .get_stcp_info(&msg.proxy_name)
+            .ok_or_else(|| {
+                Error::Proxy(format!("stcp proxy {} not found", msg.proxy_name))
+            })?;
+
+        // 2. Verify sk via HMAC signature
+        use arp_common::crypto::AuthSigner;
+        if !AuthSigner::verify(&info.sk, &msg.timestamp.to_string(), &msg.sk_signature) {
+            return Err(Error::Auth(format!(
+                "stcp visitor sk mismatch for proxy {}",
+                msg.proxy_name
+            )));
+        }
+
+        // 3. Check timestamp anti-replay (5 min window)
+        let now = chrono::Utc::now().timestamp();
+        if (now - msg.timestamp).abs() > 300 {
+            return Err(Error::Auth("stcp visitor timestamp expired".to_string()));
+        }
+
+        // 4. Request a work connection from the provider
+        let (work_conn_tx, work_conn_rx) = tokio::sync::oneshot::channel();
+        info
+            .work_conn_req_tx
+            .send(crate::proxy::WorkConnRequest {
+                proxy_name: msg.proxy_name.clone(),
+                reply_tx: work_conn_tx,
+            })
+            .await
+            .map_err(|_| Error::Transport("stcp provider work conn channel closed".to_string()))?;
+
+        let mut work_transport = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            work_conn_rx,
+        )
+        .await
+        .map_err(|_| Error::Timeout("stcp work connection timeout".to_string()))?
+        .map_err(|_| Error::Transport("stcp work connection channel closed".to_string()))?;
+
+        // 5. Send StartWorkConn to provider
+        work_transport
+            .send(Message::StartWorkConn(
+                arp_common::protocol::StartWorkConnMsg {
+                    proxy_name: msg.proxy_name.clone(),
+                    src_addr: peer_addr.clone(),
+                    dst_addr: String::new(),
+                    error: String::new(),
+                },
+            ))
+            .await?;
+
+        // 6. Send StartWorkConn back to visitor to signal readiness
+        // (visitor_transport is consumed here — we turn it into raw stream)
+        let mut visitor_stream = visitor_transport.into_inner();
+        let mut work_stream = work_transport.into_inner();
+
+        // 7. Relay bidirectionally: visitor ↔ provider
+        debug!(
+            "STCP relay started for proxy {} from {}",
+            msg.proxy_name, peer_addr
+        );
+        let _ = arp_common::transport::copy_bidirectional(
+            &mut visitor_stream,
+            &mut work_stream,
+        )
+        .await;
+        debug!(
+            "STCP relay ended for proxy {} from {}",
+            msg.proxy_name, peer_addr
+        );
+
+        Ok(())
     }
 }
 
