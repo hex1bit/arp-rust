@@ -306,6 +306,11 @@ KCP / QUIC:
 - `examples/server_quic.toml`
 - `examples/client_quic.toml`
 
+STCP (Secret TCP — no public port, sk-based access control):
+
+- `examples/client_stcp_provider.toml`
+- `examples/client_stcp_visitor.toml`
+
 XTCP:
 
 - `examples/client_xtcp_provider.toml`
