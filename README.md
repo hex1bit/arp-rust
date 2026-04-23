@@ -316,6 +316,10 @@ XTCP:
 - `examples/client_xtcp_provider.toml`
 - `examples/client_xtcp_visitor.toml`
 
+Mixed (provider + visitor in one client):
+
+- `examples/client_mixed.toml`
+
 Vhost HTTP / HTTPS:
 
 - `examples/server_vhost_http.toml`

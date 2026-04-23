@@ -1,0 +1,57 @@
+# Mixed client config — one arpc instance acting as both provider and visitor.
+#
+# This client simultaneously:
+# - Exposes local web service via TCP proxy (public port)
+# - Exposes local SSH via STCP proxy (no public port, sk-based access)
+# - Visits another client's STCP service (team-ssh)
+# - Visits another client's XTCP service (home-camera)
+
+server_addr = "server.example.com"
+server_port = 17000
+log_level = "info"
+
+admin_addr = "127.0.0.1"
+admin_port = 7400
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "tcp"
+tcp_mux = true
+pool_count = 1
+
+# ── Provider: expose local services ──
+
+[[proxies]]
+name = "my-web"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 6001
+
+[[proxies]]
+name = "my-secret-db"
+type = "stcp"
+local_ip = "127.0.0.1"
+local_port = 5432
+sk = "db-shared-secret"
+
+# ── Visitor: access other clients' secret services ──
+
+[[visitors]]
+name = "visit-team-ssh"
+type = "stcp"
+server_name = "team-ssh"
+sk = "team-ssh-secret"
+bind_addr = "127.0.0.1"
+bind_port = 2222
+
+[[visitors]]
+name = "visit-home-camera"
+type = "xtcp"
+server_name = "home-camera"
+sk = "camera-secret"
+bind_addr = "127.0.0.1"
+bind_port = 8888
