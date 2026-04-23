@@ -1,0 +1,21 @@
+# STCP Provider — registers a secret proxy that is NOT exposed on a public port.
+# Only visitors with the matching sk can access this service through the server relay.
+
+server_addr = "127.0.0.1"
+server_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "tcp"
+pool_count = 1
+
+[[proxies]]
+name = "secret_ssh"
+type = "stcp"
+local_ip = "127.0.0.1"
+local_port = 22
+sk = "stcp_shared_secret"

@@ -45,6 +45,7 @@ pub struct ProxyManager {
     vhost_manager: Arc<VhostManager>,
     tcp_groups: Arc<DashMap<String, Arc<tcp::GroupedTcpProxy>>>,
     xtcp_registry: Arc<DashMap<String, XtcpProxyInfo>>,
+    stcp_registry: Arc<DashMap<String, StcpProxyInfo>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,13 @@ pub struct XtcpProxyInfo {
     pub run_id: String,
     pub sk: String,
     pub relay_addr: String,
+}
+
+#[derive(Clone)]
+pub struct StcpProxyInfo {
+    pub run_id: String,
+    pub sk: String,
+    pub work_conn_req_tx: mpsc::Sender<WorkConnRequest>,
 }
 
 impl ProxyManager {
@@ -72,6 +80,7 @@ impl ProxyManager {
             )),
             tcp_groups: Arc::new(DashMap::new()),
             xtcp_registry: Arc::new(DashMap::new()),
+            stcp_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -94,7 +103,7 @@ impl ProxyManager {
         let proxy_name_meta = msg.proxy_name.clone();
         let proxy_type_meta = msg.proxy_type.clone();
         let (proxy, remote_addr): (Arc<dyn Proxy>, String) = match msg.proxy_type.as_str() {
-            "tcp" | "stcp" => {
+            "tcp" => {
                 let (lb_group, lb_group_key) = parse_lb_group(&msg);
                 if lb_group.is_empty() {
                     let tcp_proxy =
@@ -148,6 +157,32 @@ impl ProxyManager {
                     );
                     (Arc::new(handle), remote_addr)
                 }
+            }
+            "stcp" => {
+                if msg.sk.trim().is_empty() {
+                    return Err(Error::Proxy("stcp proxy requires sk".to_string()));
+                }
+                if self.stcp_registry.contains_key(&msg.proxy_name) {
+                    return Err(Error::Proxy(format!(
+                        "stcp proxy {} already exists",
+                        msg.proxy_name
+                    )));
+                }
+                self.stcp_registry.insert(
+                    msg.proxy_name.clone(),
+                    StcpProxyInfo {
+                        run_id: run_id.to_string(),
+                        sk: msg.sk.clone(),
+                        work_conn_req_tx: work_conn_req_tx.clone(),
+                    },
+                );
+                (
+                    Arc::new(StcpServerProxy::new(
+                        msg.proxy_name.clone(),
+                        self.stcp_registry.clone(),
+                    )),
+                    "stcp".to_string(),
+                )
             }
             "http" => {
                 let remote_addr =
@@ -375,6 +410,12 @@ impl ProxyManager {
             .get(proxy_name)
             .map(|entry| entry.value().clone())
     }
+
+    pub fn get_stcp_info(&self, proxy_name: &str) -> Option<StcpProxyInfo> {
+        self.stcp_registry
+            .get(proxy_name)
+            .map(|entry| entry.value().clone())
+    }
 }
 
 fn parse_lb_group(msg: &NewProxyMsg) -> (String, String) {
@@ -448,5 +489,39 @@ impl Proxy for XtcpProxy {
 
     fn proxy_type(&self) -> &str {
         "xtcp"
+    }
+}
+
+struct StcpServerProxy {
+    name: String,
+    stcp_registry: Arc<DashMap<String, StcpProxyInfo>>,
+}
+
+impl StcpServerProxy {
+    fn new(name: String, stcp_registry: Arc<DashMap<String, StcpProxyInfo>>) -> Self {
+        Self {
+            name,
+            stcp_registry,
+        }
+    }
+}
+
+#[async_trait]
+impl Proxy for StcpServerProxy {
+    async fn run(&self) -> Result<()> {
+        Ok(()) // no listener, purely registry-based
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.stcp_registry.remove(&self.name);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn proxy_type(&self) -> &str {
+        "stcp"
     }
 }

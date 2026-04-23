@@ -1,0 +1,23 @@
+# STCP Visitor — connects to the server and accesses an STCP provider's service
+# through a server-side relay. The sk must match the provider's sk.
+# No public port is exposed; only visitors with the correct sk can connect.
+
+server_addr = "127.0.0.1"
+server_port = 17000
+log_level = "info"
+
+[auth]
+method = "token"
+token = "replace_with_token"
+
+[transport]
+protocol = "tcp"
+pool_count = 0
+
+[[visitors]]
+name = "stcp_visitor"
+type = "stcp"
+server_name = "secret_ssh"
+sk = "stcp_shared_secret"
+bind_addr = "127.0.0.1"
+bind_port = 6000

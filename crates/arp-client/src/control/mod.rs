@@ -481,21 +481,112 @@ impl Control {
 
     async fn start_visitors(self: &Arc<Self>) {
         for visitor in self.config.visitors.clone() {
-            if visitor.visitor_type != "xtcp" {
-                warn!(
-                    "Unsupported visitor type {}, only xtcp is implemented",
-                    visitor.visitor_type
-                );
-                continue;
-            }
             let ctrl = Arc::clone(self);
             let cancel = self.cancel.child_token();
+            match visitor.visitor_type.as_str() {
+                "stcp" => {
+                    tokio::spawn(async move {
+                        if let Err(e) = ctrl.run_stcp_visitor(visitor, cancel).await {
+                            error!("stcp visitor task exited: {}", e);
+                        }
+                    });
+                }
+                "xtcp" => {
+                    tokio::spawn(async move {
+                        if let Err(e) = ctrl.run_xtcp_visitor(visitor, cancel).await {
+                            error!("xtcp visitor task exited: {}", e);
+                        }
+                    });
+                }
+                other => {
+                    warn!("Unsupported visitor type: {}", other);
+                }
+            }
+        }
+    }
+
+    async fn run_stcp_visitor(
+        self: Arc<Self>,
+        visitor: VisitorConfig,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let bind_addr = if visitor.bind_addr.trim().is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            visitor.bind_addr.clone()
+        };
+        if visitor.bind_port == 0 {
+            return Err(Error::Config(format!(
+                "stcp visitor {} bind_port cannot be 0",
+                visitor.name
+            )));
+        }
+        let listener = TcpListener::bind(format!("{}:{}", bind_addr, visitor.bind_port))
+            .await
+            .map_err(Error::Io)?;
+        info!(
+            "STCP visitor {} listening on {}:{} (server_name={})",
+            visitor.name, bind_addr, visitor.bind_port, visitor.server_name
+        );
+
+        loop {
+            let accept_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("STCP visitor {} shutting down", visitor.name);
+                    return Ok(());
+                }
+                res = listener.accept() => res,
+            };
+            let (mut inbound, inbound_addr) = accept_result.map_err(Error::Io)?;
+            let ctrl = Arc::clone(&self);
+            let visitor_cfg = visitor.clone();
             tokio::spawn(async move {
-                if let Err(e) = ctrl.run_xtcp_visitor(visitor, cancel).await {
-                    error!("xtcp visitor task exited: {}", e);
+                debug!(
+                    "STCP visitor {} accepted connection from {}",
+                    visitor_cfg.name, inbound_addr
+                );
+                if let Err(e) = Self::handle_stcp_visitor_conn(
+                    &ctrl,
+                    &visitor_cfg,
+                    &mut inbound,
+                )
+                .await
+                {
+                    error!(
+                        "STCP visitor {} connection from {} failed: {}",
+                        visitor_cfg.name, inbound_addr, e
+                    );
                 }
             });
         }
+    }
+
+    async fn handle_stcp_visitor_conn(
+        ctrl: &Arc<Self>,
+        visitor: &VisitorConfig,
+        inbound: &mut tokio::net::TcpStream,
+    ) -> Result<()> {
+        // 1. Connect to server (new connection per visitor session)
+        let mut transport =
+            connect_server_transport_cached(&ctrl.config, &ctrl.cached_transport_config).await?;
+
+        // 2. Send StcpVisitorConn handshake
+        let ts = chrono::Utc::now().timestamp();
+        transport
+            .send(Message::StcpVisitorConn(
+                arp_common::protocol::StcpVisitorConnMsg {
+                    proxy_name: visitor.server_name.clone(),
+                    sk_signature: AuthSigner::sign(&visitor.sk, &ts.to_string()),
+                    timestamp: ts,
+                },
+            ))
+            .await?;
+
+        // 3. Server will relay directly — switch to raw stream for bidirectional copy
+        let mut server_stream = transport.into_inner();
+        arp_common::transport::copy_bidirectional(inbound, &mut server_stream).await?;
+
+        Ok(())
     }
 
     async fn run_xtcp_visitor(

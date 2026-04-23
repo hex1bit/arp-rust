@@ -618,26 +618,63 @@ Notes:
 - use a UDP-capable client application to verify
 - server still enforces `allow_ports`
 
-### 6.5 STCP / SUDP shared-secret exposure
+### 6.5 STCP — Secret TCP (no public port, sk-based access control)
 
 Use when:
 
-- the tunnel should be protected by a shared secret
-- you want the provider side not to expose an open public raw proxy in the normal way
+- the service should NOT be exposed on a public port
+- only authorized users with the shared secret (`sk`) should be able to access it
+- you want access control without VPN or firewall rules
 
-Provider example:
+STCP uses a **provider + visitor** model:
+
+1. The **provider** client registers an STCP proxy with the server. No public port is opened.
+2. A **visitor** client connects to the server, proves it holds the correct `sk`, and the server relays traffic to the provider.
+3. Users connect to the visitor's local port to access the service.
+
+**Provider client config** (runs next to the service):
 
 ```toml
 [[proxies]]
-name = "secure_ssh"
+name = "secret_ssh"
 type = "stcp"
 local_ip = "127.0.0.1"
 local_port = 22
-remote_port = 6004
 sk = "replace_with_shared_secret"
 ```
 
-Same idea applies to `sudp`:
+Note: no `remote_port` is needed — the server does not open any port for STCP.
+
+**Visitor client config** (runs where the user wants to access the service):
+
+```toml
+[[visitors]]
+name = "visit_ssh"
+type = "stcp"
+server_name = "secret_ssh"
+sk = "replace_with_shared_secret"
+bind_addr = "127.0.0.1"
+bind_port = 6000
+```
+
+**Usage:**
+
+```bash
+# Start provider (on the machine with the service)
+arpc -c client_stcp_provider.toml
+
+# Start visitor (on the machine where you want to access it)
+arpc -c client_stcp_visitor.toml
+
+# Connect through the visitor's local port
+ssh user@127.0.0.1 -p 6000
+```
+
+The `sk` must match between provider and visitor. If a visitor uses a wrong `sk`, the server rejects the connection.
+
+### 6.6 SUDP — shared-secret UDP
+
+Same concept as STCP but for UDP services. Uses encryption on the relay path.
 
 ```toml
 [[proxies]]

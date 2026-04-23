@@ -4,6 +4,39 @@ All notable changes to ARP-Rust are documented in this file.
 
 ---
 
+## [0.5.1] — 2026-04-23
+
+### Changed
+
+- **STCP (Secret TCP) completely redesigned** — previous implementation was architecturally wrong (opened a public port like regular TCP). New implementation follows the correct frp STCP design:
+  - Provider registers STCP proxy → server stores in internal registry, **no public port opened**
+  - Visitor client listens on a local port, holds `sk`, connects to provider through server relay
+  - Server verifies `sk` via HMAC signature before allowing relay
+  - Only visitors with the correct `sk` can access the service
+  - New protocol message: `StcpVisitorConn` for visitor-to-server handshake
+
+### Added
+
+- New example configs: `client_stcp_provider.toml`, `client_stcp_visitor.toml`
+- `StcpVisitorConn` protocol message (type byte `v`) for STCP visitor data connections
+- Server `secret_registry` for STCP proxy entries (separate from TCP/XTCP registries)
+- Server `handle_stcp_visitor_conn` for sk verification + work connection relay
+- Client STCP visitor: local TCP listener + per-connection server relay with HMAC handshake
+
+### Fixed
+
+- STCP provider no longer opens a public port (was incorrectly sharing TCP's port-binding logic)
+- STCP provider work connections now use plain TCP mode (not encrypted relay mode, since access control is server-side)
+
+### Tested
+
+- STCP provider registers → server confirms no public port (`remote_addr = "stcp"`)
+- STCP visitor with correct sk → HTTP 200 through server relay
+- STCP visitor with wrong sk → rejected (`stcp visitor sk mismatch`)
+- All 33 unit tests passing
+
+---
+
 ## [0.4.2] — 2026-04-22
 
 ### Fixed
