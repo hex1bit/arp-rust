@@ -119,7 +119,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arp-client"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arp-common",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "arp-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "arp-server"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arp-common",
