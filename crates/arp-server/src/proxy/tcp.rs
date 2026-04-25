@@ -22,6 +22,17 @@ use crate::resource::ResourceController;
 const BACKEND_EJECT_SECS: u64 = 5;
 const BACKEND_FAIL_THRESHOLD: u32 = 1;
 
+/// Returns true for accept() errors that are transient and retriable.
+/// EMFILE (24) = per-process fd limit; ENFILE (23) = system-wide fd limit.
+/// These are recoverable once existing connections are closed.
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
+        return true;
+    }
+    matches!(e.raw_os_error(), Some(23) | Some(24))
+}
+
 pub struct TcpProxy {
     name: String,
     remote_port: u16,
@@ -197,12 +208,16 @@ impl Proxy for TcpProxy {
                 .ok_or_else(|| Error::Transport(format!("TCP proxy {} listener already taken", self.name)))?
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Backoff delay (ms) for transient accept errors (EMFILE, ENFILE, …).
+        // Doubles on each consecutive error: 10 → 20 → 40 → … → 1000ms.
+        let mut backoff_ms: u64 = 0;
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((client_stream, addr)) => {
+                            backoff_ms = 0; // reset on successful accept
                             let client_addr = addr.to_string();
                             let proxy_name = self.name.clone();
                             let remote_port = self.remote_port;
@@ -239,8 +254,18 @@ impl Proxy for TcpProxy {
                                 }
                             });
                         }
+                        Err(e) if is_transient_accept_error(&e) => {
+                            // Exponential backoff to avoid tight busy-loop on EMFILE/ENFILE.
+                            backoff_ms = if backoff_ms == 0 { 10 } else { (backoff_ms * 2).min(1000) };
+                            warn!(
+                                "TCP proxy {} accept transient error (retry in {}ms): {}",
+                                self.name, backoff_ms, e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        }
                         Err(e) => {
                             error!("TCP proxy {} accept error: {}", self.name, e);
+                            break;
                         }
                     }
                 }
@@ -460,17 +485,33 @@ impl GroupedTcpProxy {
             })?
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut backoff_ms: u64 = 0;
         loop {
             tokio::select! {
                 res = listener.accept() => {
-                    let (client_stream, addr) = res.map_err(Error::Io)?;
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = this.handle_client(client_stream, addr.to_string()).await {
-                            metrics::inc_tcp_proxy_errors();
-                            warn!("tcp group {} client {} failed: {}", this.group_id, addr, e);
+                    match res {
+                        Ok((client_stream, addr)) => {
+                            backoff_ms = 0;
+                            let this = self.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = this.handle_client(client_stream, addr.to_string()).await {
+                                    metrics::inc_tcp_proxy_errors();
+                                    warn!("tcp group {} client {} failed: {}", this.group_id, addr, e);
+                                }
+                            });
                         }
-                    });
+                        Err(e) if is_transient_accept_error(&e) => {
+                            backoff_ms = if backoff_ms == 0 { 10 } else { (backoff_ms * 2).min(1000) };
+                            warn!(
+                                "TCP group {} accept transient error (retry in {}ms): {}",
+                                self.group_id, backoff_ms, e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(e) => {
+                            return Err(Error::Io(e));
+                        }
+                    }
                 }
                 _ = shutdown_rx.recv() => {
                     info!("TCP group {} shutting down", self.group_id);
