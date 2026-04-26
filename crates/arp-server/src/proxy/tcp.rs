@@ -142,6 +142,12 @@ impl MuxTunnel {
         self.streams.lock().await.remove(&stream_id);
         let _ = self.frame_tx.send(MuxFrame::Close { stream_id }).await;
     }
+
+    /// Returns false when the underlying work connection has died
+    /// (writer task exited and dropped frame_rx).
+    fn is_alive(&self) -> bool {
+        !self.frame_tx.is_closed()
+    }
 }
 
 impl TcpProxy {
@@ -724,8 +730,13 @@ async fn get_or_create_mux_tunnel(
     mux_tunnel: Arc<Mutex<Option<Arc<MuxTunnel>>>>,
 ) -> Result<Arc<MuxTunnel>> {
     let mut guard = mux_tunnel.lock().await;
-    if let Some(tunnel) = guard.clone() {
-        return Ok(tunnel);
+    if let Some(tunnel) = guard.as_ref() {
+        if tunnel.is_alive() {
+            return Ok(Arc::clone(tunnel));
+        }
+        // Work connection dropped — discard the dead tunnel and reconnect.
+        warn!("tcp_mux tunnel for proxy {} is dead, reconnecting", proxy_name);
+        *guard = None;
     }
 
     let work_transport = request_work_transport(proxy_name, remote_port, work_conn_req_tx).await?;

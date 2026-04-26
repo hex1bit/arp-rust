@@ -254,25 +254,41 @@ impl Service {
         let peer_addr = stream.peer_addr().map_err(|e| Error::Io(e))?;
         let transport = if self.config.transport.protocol == arp_common::config::TransportProtocol::Websocket {
             if let Some(acceptor) = &self.tls_acceptor {
-                let tls_stream = acceptor
-                    .accept(stream)
-                    .await
-                    .map_err(|e| Error::Transport(format!("WSS TLS accept failed: {}", e)))?;
-                let ws = accept_async(tls_stream)
-                    .await
-                    .map_err(|e| Error::Transport(format!("WSS accept failed: {}", e)))?;
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // External scanners / bots probing the port without a valid TLS handshake.
+                        // Log at warn to reduce noise; this is not an internal error.
+                        warn!("WSS TLS handshake from {} rejected: {}", peer_addr, e);
+                        return Ok(());
+                    }
+                };
+                let ws = match accept_async(tls_stream).await {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        warn!("WSS upgrade from {} failed: {}", peer_addr, e);
+                        return Ok(());
+                    }
+                };
                 MessageTransport::from_stream(websocket_to_stream(ws))
             } else {
-                let ws = accept_async(stream)
-                    .await
-                    .map_err(|e| Error::Transport(format!("WS accept failed: {}", e)))?;
+                let ws = match accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        warn!("WS upgrade from {} failed: {}", peer_addr, e);
+                        return Ok(());
+                    }
+                };
                 MessageTransport::from_stream(websocket_to_stream(ws))
             }
         } else if let Some(acceptor) = &self.tls_acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| Error::Transport(format!("TLS accept failed: {}", e)))?;
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("TLS handshake from {} rejected: {}", peer_addr, e);
+                    return Ok(());
+                }
+            };
             MessageTransport::from_stream(Box::new(tls_stream))
         } else {
             MessageTransport::new(stream)
