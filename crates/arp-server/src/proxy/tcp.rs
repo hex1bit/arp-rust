@@ -94,7 +94,14 @@ impl MuxTunnel {
                         let tx = streams_reader.lock().await.get(&stream_id).cloned();
                         if let Some(tx) = tx {
                             if tx.send(payload).await.is_err() {
+                                // The local stream consumer has dropped its receiver
+                                // (i.e. the downstream TCP client disconnected).
+                                // Remove the stream entry and notify the remote peer
+                                // so it stops sending data into this dead stream.
                                 streams_reader.lock().await.remove(&stream_id);
+                                let _ = writer_frame_tx
+                                    .send(MuxFrame::Close { stream_id })
+                                    .await;
                             }
                         } else {
                             let _ = writer_frame_tx.send(MuxFrame::Close { stream_id }).await;

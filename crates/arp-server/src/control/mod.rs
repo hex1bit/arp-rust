@@ -99,6 +99,23 @@ impl Control {
         self.cancel.cancel();
     }
 
+    /// Send a `ServerShutdown` message to the client, then cancel after a short
+    /// delay so the message has a chance to be flushed before the TCP connection
+    /// is torn down.  This lets the client exit cleanly instead of reconnecting.
+    pub fn shutdown_graceful(self: Arc<Self>) {
+        let _ = self.outbound_tx.try_send(
+            arp_common::protocol::message::Message::ServerShutdown(
+                arp_common::protocol::message::ServerShutdownMsg {
+                    reason: "server requested shutdown".to_string(),
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            self.cancel.cancel();
+        });
+    }
+
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -497,14 +514,15 @@ impl ControlManager {
     }
 
     /// Shutdown and remove a control connection by run_id.
-    /// Used to forcefully close a stale connection whose proxy was evicted.
+    /// Sends a `ServerShutdown` message first so the client can exit cleanly
+    /// without triggering its reconnect logic.
     pub fn shutdown_run(&self, run_id: &str) {
         if let Some((_, control)) = self.controls.remove(run_id) {
             warn!(
-                "Shutting down stale control connection for run_id: {}",
+                "Shutting down control connection for run_id: {}",
                 run_id
             );
-            control.shutdown();
+            control.shutdown_graceful();
         }
     }
 

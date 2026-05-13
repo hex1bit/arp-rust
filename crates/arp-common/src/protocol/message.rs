@@ -18,6 +18,8 @@ pub enum Message {
     NatHoleClient(NatHoleClientMsg),
     NatHoleResp(NatHoleRespMsg),
     StcpVisitorConn(StcpVisitorConnMsg),
+    /// Sent by the server to ask the client to exit gracefully (no reconnect).
+    ServerShutdown(ServerShutdownMsg),
 }
 
 impl Message {
@@ -38,6 +40,7 @@ impl Message {
             Message::NatHoleClient(_) => b'n',
             Message::NatHoleResp(_) => b'm',
             Message::StcpVisitorConn(_) => b'v',
+            Message::ServerShutdown(_) => b'x',
         }
     }
 
@@ -58,6 +61,7 @@ impl Message {
             b'n' => Some("NatHoleClient"),
             b'm' => Some("NatHoleResp"),
             b'v' => Some("StcpVisitorConn"),
+            b'x' => Some("ServerShutdown"),
             _ => None,
         }
     }
@@ -211,6 +215,15 @@ pub struct StcpVisitorConnMsg {
     pub proxy_name: String,
     pub sk_signature: String,
     pub timestamp: i64,
+}
+
+/// Sent by the server to ask the client to disconnect and NOT reconnect.
+/// Used by the `/api/v1/clients/:run_id/shutdown` admin endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerShutdownMsg {
+    /// Human-readable reason (optional).
+    #[serde(default)]
+    pub reason: String,
 }
 
 fn default_true() -> bool {

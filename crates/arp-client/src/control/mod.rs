@@ -784,6 +784,13 @@ impl Control {
 
         loop {
             tokio::select! {
+                // Honour a graceful shutdown requested by the server
+                // (e.g. via the /api/v1/clients/:run_id/shutdown endpoint)
+                // or a local cancellation.
+                _ = self.cancel.cancelled() => {
+                    info!("Control loop cancelled — shutting down gracefully");
+                    return Ok(());
+                }
                 _ = timeout_checker.tick() => {
                     let now = chrono::Utc::now().timestamp();
                     let last = self.last_pong.load(Ordering::Relaxed);
@@ -833,6 +840,15 @@ impl Control {
                             continue;
                         }
                         Err(Error::ConnectionClosed) => {
+                            // If we are being gracefully shut down (cancel was
+                            // requested), the server may close the TCP connection
+                            // before our cancel branch fires.  Treat a close
+                            // during cancellation as a clean exit, not a retriable
+                            // reconnect.
+                            if self.cancel.is_cancelled() {
+                                info!("Connection closed by server during shutdown — exiting cleanly");
+                                return Ok(());
+                            }
                             warn!("Connection closed by server, will reconnect");
                             return Err(Error::ConnectionClosed);
                         }
@@ -933,6 +949,13 @@ impl Control {
                         }
                         Message::NatHoleResp(resp) => {
                             self.handle_nathole_response(resp).await;
+                        }
+                        Message::ServerShutdown(msg) => {
+                            info!(
+                                "Received ServerShutdown from server: {} — exiting without reconnect",
+                                msg.reason
+                            );
+                            return Ok(());
                         }
                         _ => {
                             warn!("Unexpected message type: {:?}", msg.type_byte() as char);
