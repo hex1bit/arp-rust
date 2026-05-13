@@ -4,6 +4,46 @@ All notable changes to ARP-Rust are documented in this file.
 
 ---
 
+## [0.5.5] — 2026-05-13
+
+### Fixed
+
+- **ThrottledStream rate limiting completely ineffective** — the previous implementation used `tokio::spawn` (fire-and-forget) to consume tokens after data was already returned to the caller, providing zero actual backpressure. The stream is now rewritten with two internal fields:
+  - `pending_data: Option<Bytes>` — bytes read from the inner stream but waiting for token approval
+  - `pending_consume: Option<Pin<Box<dyn Future>>>` — the in-flight `consume()` future
+  - `poll_read` now stores data in `pending_data` first (never touching the caller's `ReadBuf` until tokens are granted), satisfying the `AsyncRead` contract
+  - New tests: `test_throttled_stream_enforces_rate` (3 KB at 1 KB/s ≥ 1.5 s) and `test_throttle_drop_does_not_leak`
+
+- **`Throttle` background refill task memory leak** — the background task held a strong `Arc<Semaphore>` reference, preventing cleanup even after all `Arc<Throttle>` clones were dropped. Fixed by using `Arc::downgrade`; the task now exits automatically when the last `Throttle` is dropped.
+
+- **`MuxTunnel` sub-stream close not notifying peer** — when the local sub-stream receiver was dropped (downstream TCP client disconnected), the MuxTunnel reader loop only removed the entry from the streams map but never sent a `MuxFrame::Close` back to the client. The client would continue sending data into the dead stream. Now sends `MuxFrame::Close { stream_id }` in both the "stream not found" and "send error" branches.
+
+- **Admin `shutdown` API did not stop client from reconnecting** — `shutdown_run` previously called `cancel()` directly, which closed the TCP connection. The client treated the resulting `ConnectionClosed` error as retriable and re-connected. Now:
+  1. Server sends a new `ServerShutdown` protocol message before closing
+  2. Client `run_message_loop` handles `Message::ServerShutdown` → returns `Ok(())` (no reconnect)
+  3. `run_message_loop` also monitors `CancellationToken` directly via a `select!` branch
+
+### Added
+
+- **`Message::ServerShutdown(ServerShutdownMsg)`** — new protocol message (type byte `'x'`) that the server sends to ask a client to exit without reconnecting. Carries an optional `reason` string for logging.
+
+### Changed
+
+- **`Control::shutdown_graceful()`** (server) — new method used by `ControlManager::shutdown_run`. Sends `ServerShutdown` via the outbound channel then cancels the connection after a 300 ms grace period, giving the message time to flush.
+
+- **`test_e2e_stcp_sudp.sh` rewritten** — previous script used bare `nc` to connect to an STCP port (STCP requires an HMAC-signed visitor handshake, so `nc` always fails). New script:
+  - Starts a provider `arpc` with `stcp` + `udp` proxies
+  - Starts a visitor `arpc` with an `[[visitors]]` stcp entry (binds local port 22250)
+  - Tests STCP through the visitor local port (end-to-end echo)
+  - Tests plain UDP proxy via direct UDP send to server port
+
+### Tested
+
+- All 35 unit tests pass (1 ignored — requires open TCP listener)
+- All 14 E2E test scripts pass
+
+---
+
 ## [0.5.1] — 2026-04-23
 
 ### Changed
